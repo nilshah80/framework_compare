@@ -1,0 +1,423 @@
+package main
+
+import (
+	"bytes"
+	"crypto/rand"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+// --- Request/Response types ---
+
+type CreateOrderReq struct {
+	Items    []OrderItem `json:"items"`
+	Currency string      `json:"currency"`
+}
+
+// GetOrderReq binds request data from multiple sources
+type GetOrderReq struct {
+	UserID  string `uri:"userId"`
+	OrderID string `uri:"orderId"`
+	Fields  string `form:"fields"`
+	Token   string `header:"X-Api-Key"`
+}
+
+// OrderResponse is the response structure
+type OrderResponse struct {
+	OrderID   string      `json:"order_id"`
+	UserID    string      `json:"user_id"`
+	Status    string      `json:"status"`
+	Items     []OrderItem `json:"items"`
+	Total     float64     `json:"total"`
+	Currency  string      `json:"currency"`
+	Fields    string      `json:"fields,omitempty"`
+	RequestID string      `json:"request_id"`
+}
+
+type OrderItem struct {
+	ProductID string  `json:"product_id"`
+	Name      string  `json:"name"`
+	Quantity  int     `json:"quantity"`
+	Price     float64 `json:"price"`
+}
+
+// --- In-memory store ---
+
+var (
+	orderStore   = make(map[string]OrderResponse)
+	orderMu      sync.RWMutex
+	orderCounter int64
+	counterMu    sync.Mutex
+)
+
+func nextOrderID() string {
+	counterMu.Lock()
+	orderCounter++
+	id := fmt.Sprintf("%d", orderCounter)
+	counterMu.Unlock()
+	return id
+}
+
+func storeKey(userID, orderID string) string {
+	return userID + ":" + orderID
+}
+
+// responseWriter wraps gin.ResponseWriter to capture response body
+type responseWriter struct {
+	gin.ResponseWriter
+	body *bytes.Buffer
+}
+
+func (w *responseWriter) Write(b []byte) (int, error) {
+	w.body.Write(b)
+	return w.ResponseWriter.Write(b)
+}
+
+func (w *responseWriter) WriteString(s string) (int, error) {
+	w.body.WriteString(s)
+	return w.ResponseWriter.WriteString(s)
+}
+
+// generateUUID generates a UUID v4 without external dependencies
+func generateUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// Sensitive fields for PII redaction
+var sensitiveHeaders = map[string]bool{
+	"authorization": true, "cookie": true, "set-cookie": true,
+	"x-api-key": true, "x-auth-token": true,
+}
+
+// redactPII redacts sensitive fields in headers
+func redactPII(key string, value any) any {
+	if sensitiveHeaders[strings.ToLower(key)] {
+		if s, ok := value.(string); ok && len(s) > 0 {
+			return "[REDACTED]"
+		}
+	}
+	return value
+}
+
+// recoveryMiddleware catches panics and logs them
+func recoveryMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		defer func() {
+			if err := recover(); err != nil {
+				stack := debug.Stack()
+				slog.Error("panic recovered",
+					"error", err,
+					"stack_trace", string(stack),
+					"path", c.Request.URL.Path,
+					"method", c.Request.Method,
+				)
+				c.JSON(500, gin.H{
+					"error": "Internal Server Error",
+				})
+			}
+		}()
+		c.Next()
+	}
+}
+
+// requestIDMiddleware reads or generates request ID
+func requestIDMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		requestID := c.GetHeader("X-Request-ID")
+		if requestID == "" {
+			requestID = generateUUID()
+		}
+		c.Set("request_id", requestID)
+		c.Header("X-Request-ID", requestID)
+		c.Next()
+	}
+}
+
+// secureMiddleware sets security headers matching aarv secure.DefaultConfig()
+func secureMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("X-XSS-Protection", "1; mode=block")
+		c.Header("X-Content-Type-Options", "nosniff")
+		c.Header("X-Frame-Options", "DENY")
+		c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		c.Header("Content-Security-Policy", "default-src 'self'")
+		c.Header("Referrer-Policy", "strict-origin-when-cross-origin")
+		c.Header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+		c.Header("Cross-Origin-Opener-Policy", "same-origin")
+		c.Next()
+	}
+}
+
+// corsMiddleware sets CORS headers matching aarv cors.DefaultConfig()
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
+	}
+}
+
+// bodyLimitMiddleware rejects requests with body larger than maxBytes
+func bodyLimitMiddleware(maxBytes int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.ContentLength > maxBytes {
+			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body too large"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// structuredLoggerMiddleware logs a single http_dump line per request
+func structuredLoggerMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		start := time.Now()
+		requestID, _ := c.Get("request_id")
+		reqID, _ := requestID.(string)
+
+		// Capture request headers
+		reqHeaders := make(map[string]any)
+		for key, values := range c.Request.Header {
+			if len(values) > 0 {
+				reqHeaders[key] = redactPII(key, values[0])
+			}
+		}
+
+		// Wrap response writer to capture response body
+		blw := &responseWriter{
+			ResponseWriter: c.Writer,
+			body:           bytes.NewBuffer(nil),
+		}
+		c.Writer = blw
+
+		c.Next()
+
+		latency := time.Since(start)
+		latencyMs := float64(latency.Microseconds()) / 1000.0
+
+		// Build query params map
+		queryParams := make(map[string]string)
+		for k, v := range c.Request.URL.Query() {
+			if len(v) > 0 {
+				queryParams[k] = v[0]
+			}
+		}
+
+		// Capture response headers
+		respHeaders := make(map[string]any)
+		for key, values := range c.Writer.Header() {
+			if len(values) > 0 {
+				respHeaders[key] = redactPII(key, values[0])
+			}
+		}
+
+		// Single http_dump log line
+		slog.Info("http_dump",
+			slog.String("request_id", reqID),
+			slog.String("method", c.Request.Method),
+			slog.String("path", c.Request.URL.Path),
+			slog.Any("query", queryParams),
+			slog.String("client_ip", c.ClientIP()),
+			slog.String("user_agent", c.Request.UserAgent()),
+			slog.Any("request_headers", reqHeaders),
+			slog.Int("status", c.Writer.Status()),
+			slog.String("latency", latency.String()),
+			slog.Float64("latency_ms", latencyMs),
+			slog.Any("response_headers", respHeaders),
+			slog.String("response_body", blw.body.String()),
+			slog.Int("bytes_out", c.Writer.Size()),
+		)
+	}
+}
+
+func main() {
+	// Setup slog with JSON handler
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+
+	// Register custom middlewares
+	router.Use(recoveryMiddleware())
+	router.Use(requestIDMiddleware())
+	router.Use(corsMiddleware())
+	router.Use(secureMiddleware())
+	router.Use(bodyLimitMiddleware(1 << 20))
+	router.Use(structuredLoggerMiddleware())
+
+	// Grouped routes: /users/:userId/orders
+	orders := router.Group("/users/:userId/orders")
+	{
+		// POST /users/:userId/orders — create order
+		orders.POST("", func(c *gin.Context) {
+			var req CreateOrderReq
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+				return
+			}
+
+			userID := c.Param("userId")
+			orderID := nextOrderID()
+
+			var total float64
+			for _, item := range req.Items {
+				total += item.Price * float64(item.Quantity)
+			}
+
+			currency := req.Currency
+			if currency == "" {
+				currency = "USD"
+			}
+
+			requestID, _ := c.Get("request_id")
+
+			order := OrderResponse{
+				OrderID:   orderID,
+				UserID:    userID,
+				Status:    "created",
+				Items:     req.Items,
+				Total:     total,
+				Currency:  currency,
+				RequestID: requestID.(string),
+			}
+
+			orderMu.Lock()
+			orderStore[storeKey(userID, orderID)] = order
+			orderMu.Unlock()
+
+			c.JSON(http.StatusCreated, order)
+		})
+
+		// PUT /users/:userId/orders/:orderId — update order
+		orders.PUT("/:orderId", func(c *gin.Context) {
+			var body CreateOrderReq
+			if err := c.ShouldBindJSON(&body); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+				return
+			}
+
+			userID := c.Param("userId")
+			orderID := c.Param("orderId")
+			requestID, _ := c.Get("request_id")
+			reqID, _ := requestID.(string)
+
+			key := storeKey(userID, orderID)
+
+			orderMu.Lock()
+			order, ok := orderStore[key]
+			if !ok {
+				orderMu.Unlock()
+				c.JSON(http.StatusNotFound, gin.H{
+					"error":      "order not found",
+					"order_id":   orderID,
+					"request_id": reqID,
+				})
+				return
+			}
+
+			order.Items = body.Items
+			var total float64
+			for _, item := range body.Items {
+				total += item.Price * float64(item.Quantity)
+			}
+			order.Total = total
+
+			currency := body.Currency
+			if currency == "" {
+				currency = "USD"
+			}
+			order.Currency = currency
+			order.Status = "updated"
+			order.RequestID = reqID
+			orderStore[key] = order
+			orderMu.Unlock()
+
+			c.JSON(http.StatusOK, order)
+		})
+
+		// DELETE /users/:userId/orders/:orderId — delete order
+		orders.DELETE("/:orderId", func(c *gin.Context) {
+			userID := c.Param("userId")
+			orderID := c.Param("orderId")
+			requestID, _ := c.Get("request_id")
+			reqID, _ := requestID.(string)
+
+			key := storeKey(userID, orderID)
+
+			orderMu.Lock()
+			_, ok := orderStore[key]
+			if !ok {
+				orderMu.Unlock()
+				c.JSON(http.StatusNotFound, gin.H{
+					"error":      "order not found",
+					"order_id":   orderID,
+					"request_id": reqID,
+				})
+				return
+			}
+			delete(orderStore, key)
+			orderMu.Unlock()
+
+			c.JSON(http.StatusOK, gin.H{
+				"message":    "order deleted",
+				"order_id":   orderID,
+				"request_id": reqID,
+			})
+		})
+
+		// GET /users/:userId/orders/:orderId — fetch order from memory
+		orders.GET("/:orderId", func(c *gin.Context) {
+			userID := c.Param("userId")
+			orderID := c.Param("orderId")
+			fields := c.DefaultQuery("fields", "*")
+
+			requestID, _ := c.Get("request_id")
+			reqID, _ := requestID.(string)
+
+			orderMu.RLock()
+			order, ok := orderStore[storeKey(userID, orderID)]
+			orderMu.RUnlock()
+
+			if !ok {
+				c.JSON(http.StatusNotFound, gin.H{
+					"error":      "order not found",
+					"order_id":   orderID,
+					"request_id": reqID,
+				})
+				return
+			}
+
+			order.Fields = fields
+			order.RequestID = reqID
+			c.JSON(http.StatusOK, order)
+		})
+	}
+
+	// Start server on port 8082
+	slog.Info("server starting", slog.String("port", "8082"))
+	if err := router.Run(":8082"); err != nil {
+		slog.Error("failed to start server", "error", err)
+		os.Exit(1)
+	}
+}

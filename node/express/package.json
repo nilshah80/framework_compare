@@ -1,0 +1,13 @@
+{
+  "name": "framework-compare-express",
+  "version": "1.0.0",
+  "description": "Express framework benchmark implementation",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "uuid": "^11.1.0"
+  }
+}

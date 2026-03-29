@@ -1,0 +1,44 @@
+# Logs
+logs/
+
+# Benchmark results
+results/
+
+# Go binaries
+go/aarv/aarv
+go/aarv-segmentio/aarv-segmentio
+go/echo/echo
+go/fiber/fiber
+go/gin/gin
+go/mach/mach
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+appsettings.Development.json
+Properties/launchSettings.json
+
+# Node
+node_modules/
+package-lock.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.claude/

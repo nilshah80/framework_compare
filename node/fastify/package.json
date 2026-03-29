@@ -1,0 +1,13 @@
+{
+  "name": "framework-compare-fastify",
+  "version": "1.0.0",
+  "description": "Fastify framework benchmark implementation",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "fastify": "^5.3.3",
+    "@fastify/cors": "^11.0.1"
+  }
+}
