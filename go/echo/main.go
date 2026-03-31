@@ -195,6 +195,7 @@ func main() {
 	// Extra security headers not covered by Echo's Secure middleware
 	e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) error {
+			c.Response().Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 			c.Response().Header().Set("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
 			c.Response().Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 			return next(c)

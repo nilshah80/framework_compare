@@ -27,6 +27,15 @@ go/mach/mach
 appsettings.Development.json
 Properties/launchSettings.json
 
+# Java
+**/target/
+*.class
+*.jar
+dependency-reduced-pom.xml
+
+# Rust (target/ already covered by **/target/ above)
+Cargo.lock
+
 # Node
 node_modules/
 package-lock.json

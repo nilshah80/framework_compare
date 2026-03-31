@@ -1,0 +1,6 @@
+micronaut:
+  server:
+    port: 8104
+    max-request-size: 1048576
+  application:
+    name: micronaut-benchmark

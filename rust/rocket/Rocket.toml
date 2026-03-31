@@ -1,0 +1,4 @@
+[default]
+port = 8113
+address = "0.0.0.0"
+limits = { json = "1 MiB" }

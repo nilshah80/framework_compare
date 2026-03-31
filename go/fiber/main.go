@@ -162,6 +162,11 @@ func main() {
 		PermissionPolicy:        "geolocation=(), microphone=(), camera=()",
 		CrossOriginOpenerPolicy: "same-origin",
 	}))
+	// HSTS is only sent on HTTPS by helmet; add it manually for HTTP parity
+	app.Use(func(c *fiber.Ctx) error {
+		c.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		return c.Next()
+	})
 	app.Use(structuredLoggerMiddleware)
 
 	// Grouped routes: /users/:userId/orders
