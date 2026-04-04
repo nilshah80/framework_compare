@@ -6,6 +6,7 @@ use rocket::response::{self, Responder, Response};
 use rocket::serde::json::Json;
 use rocket::{catch, catchers, launch, post, put, delete, get, routes, Build, Rocket, State};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -56,10 +57,111 @@ struct ErrorResponse {
     error: String,
 }
 
+// ─── Bulk Orders types ───
+
+#[derive(Debug, Clone, Deserialize)]
+struct BulkCreateOrderReq {
+    orders: Vec<OrderRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BulkOrderResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    total_sum: f64,
+    request_id: String,
+}
+
+// ─── List Orders response ───
+
+#[derive(Debug, Clone, Serialize)]
+struct ListOrdersResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    request_id: String,
+}
+
+// ─── User Profile types ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserProfile {
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    phone: String,
+    #[serde(default)]
+    address: Address,
+    #[serde(default)]
+    preferences: ProfilePreferences,
+    #[serde(default)]
+    payment_methods: Vec<PaymentMethod>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+    #[serde(default)]
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Address {
+    #[serde(default)]
+    street: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    zip: String,
+    #[serde(default)]
+    country: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProfilePreferences {
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    notifications: NotificationPrefs,
+    #[serde(default)]
+    theme: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotificationPrefs {
+    #[serde(default)]
+    email: bool,
+    #[serde(default)]
+    sms: bool,
+    #[serde(default)]
+    push: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaymentMethod {
+    #[serde(rename = "type")]
+    type_: String,
+    last4: String,
+    expiry_month: i32,
+    expiry_year: i32,
+    is_default: bool,
+}
+
 // ─── Store ───
 
 struct AppState {
     store: DashMap<String, StoredOrder>,
+    profiles: DashMap<String, UserProfile>,
     next_id: AtomicU64,
 }
 
@@ -477,12 +579,155 @@ fn get_order(
     }
 }
 
+// ─── Bulk + List + Profile Routes ───
+
+#[post("/users/<user_id>/orders/bulk", format = "json", data = "<body>")]
+fn bulk_create_orders(
+    user_id: &str,
+    body: Json<BulkCreateOrderReq>,
+    state: &State<AppState>,
+    req_id: ReqId,
+) -> JsonBody<BulkOrderResponse> {
+    let mut results = Vec::new();
+    let mut total_sum = 0.0;
+
+    for order_req in &body.orders {
+        let id = state.next_id.fetch_add(1, Ordering::SeqCst);
+        let order_id = id.to_string();
+        let total: f64 = order_req.items.iter().map(|i| i.price * i.quantity as f64).sum();
+        let currency = if order_req.currency.is_empty() {
+            "USD".to_string()
+        } else {
+            order_req.currency.clone()
+        };
+
+        let stored = StoredOrder {
+            order_id: order_id.clone(),
+            user_id: user_id.to_string(),
+            items: order_req.items.clone(),
+            total,
+            currency: currency.clone(),
+        };
+        state
+            .store
+            .insert(format!("{}:{}", user_id, order_id), stored);
+
+        results.push(OrderResponse {
+            order_id,
+            user_id: user_id.to_string(),
+            status: "created".to_string(),
+            items: order_req.items.clone(),
+            total,
+            currency,
+            fields: "*".to_string(),
+            request_id: req_id.0.clone(),
+        });
+        total_sum += total;
+    }
+
+    JsonBody {
+        status: Status::Created,
+        request_id: req_id.0.clone(),
+        body: BulkOrderResponse {
+            user_id: user_id.to_string(),
+            count: results.len(),
+            orders: results,
+            total_sum,
+            request_id: req_id.0,
+        },
+    }
+}
+
+#[get("/users/<user_id>/orders")]
+fn list_orders(
+    user_id: &str,
+    state: &State<AppState>,
+    req_id: ReqId,
+) -> JsonBody<ListOrdersResponse> {
+    let prefix = format!("{}:", user_id);
+    let mut results = Vec::new();
+
+    for entry in state.store.iter() {
+        if entry.key().starts_with(&prefix) {
+            let stored = entry.value();
+            results.push(OrderResponse {
+                order_id: stored.order_id.clone(),
+                user_id: stored.user_id.clone(),
+                status: "created".to_string(),
+                items: stored.items.clone(),
+                total: stored.total,
+                currency: stored.currency.clone(),
+                fields: "*".to_string(),
+                request_id: req_id.0.clone(),
+            });
+        }
+    }
+
+    JsonBody {
+        status: Status::Ok,
+        request_id: req_id.0.clone(),
+        body: ListOrdersResponse {
+            user_id: user_id.to_string(),
+            count: results.len(),
+            orders: results,
+            request_id: req_id.0,
+        },
+    }
+}
+
+#[put("/users/<user_id>/profile", format = "json", data = "<body>")]
+fn put_profile(
+    user_id: &str,
+    body: Json<UserProfile>,
+    state: &State<AppState>,
+    req_id: ReqId,
+) -> JsonBody<UserProfile> {
+    let mut profile = body.into_inner();
+    profile.user_id = user_id.to_string();
+    profile.request_id = req_id.0.clone();
+
+    state.profiles.insert(user_id.to_string(), profile.clone());
+
+    JsonBody {
+        status: Status::Ok,
+        request_id: req_id.0,
+        body: profile,
+    }
+}
+
+#[get("/users/<user_id>/profile")]
+fn get_profile(
+    user_id: &str,
+    state: &State<AppState>,
+    req_id: ReqId,
+) -> Result<JsonBody<UserProfile>, JsonBody<ErrorResponse>> {
+    match state.profiles.get(user_id) {
+        Some(entry) => {
+            let mut profile = entry.value().clone();
+            profile.request_id = req_id.0.clone();
+            Ok(JsonBody {
+                status: Status::Ok,
+                request_id: req_id.0,
+                body: profile,
+            })
+        }
+        None => Err(JsonBody {
+            status: Status::NotFound,
+            request_id: req_id.0.clone(),
+            body: ErrorResponse {
+                error: "profile not found".to_string(),
+            },
+        }),
+    }
+}
+
 // ─── Launch ───
 
 #[launch]
 fn rocket() -> Rocket<Build> {
     let state = AppState {
         store: DashMap::new(),
+        profiles: DashMap::new(),
         next_id: AtomicU64::new(1),
     };
 
@@ -493,7 +738,16 @@ fn rocket() -> Rocket<Build> {
         .attach(LoggerFairing)
         .mount(
             "/",
-            routes![create_order, update_order, delete_order, get_order],
+            routes![
+                create_order,
+                update_order,
+                delete_order,
+                get_order,
+                bulk_create_orders,
+                list_orders,
+                put_profile,
+                get_profile
+            ],
         )
         .register("/", catchers![internal_error, payload_too_large, not_found])
 }

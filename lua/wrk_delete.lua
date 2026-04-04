@@ -22,5 +22,6 @@ end
 function request()
     local id = counter
     counter = counter + stride
-    return wrk.format("DELETE", "/users/user123/orders/" .. id, {["X-Api-Key"] = "bench-token"})
+    local user = os.getenv("DELETE_USER") or "user123"
+    return wrk.format("DELETE", "/users/" .. user .. "/orders/" .. id, {["X-Api-Key"] = "bench-token"})
 end

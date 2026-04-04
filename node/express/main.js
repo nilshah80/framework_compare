@@ -8,6 +8,7 @@ const PORT = 8091;
 
 // ── In-memory store ──────────────────────────────────────────────────
 const orderStore = new Map();
+const profileStore = new Map();
 let orderCounter = 0;
 
 function nextOrderID() {
@@ -259,6 +260,86 @@ app.get("/users/:userId/orders/:orderId", (req, res) => {
   order.request_id = req.requestId;
 
   res.json(order);
+});
+
+// POST /users/:userId/orders/bulk — Bulk Create Orders
+app.post("/users/:userId/orders/bulk", (req, res) => {
+  const { userId } = req.params;
+  const { orders } = req.body || {};
+
+  const results = [];
+  let totalSum = 0;
+
+  for (const item of orders || []) {
+    let total = 0;
+    for (const i of item.items || []) {
+      total += i.price * i.quantity;
+    }
+
+    const orderId = nextOrderID();
+    const order = {
+      order_id: orderId,
+      user_id: userId,
+      status: "created",
+      items: item.items || [],
+      total,
+      currency: item.currency || "USD",
+      fields: "",
+      request_id: req.requestId,
+    };
+
+    orderStore.set(storeKey(userId, orderId), order);
+    results.push(order);
+    totalSum += total;
+  }
+
+  res.status(201).json({
+    user_id: userId,
+    count: results.length,
+    orders: results,
+    total_sum: totalSum,
+    request_id: req.requestId,
+  });
+});
+
+// GET /users/:userId/orders — List All Orders
+app.get("/users/:userId/orders", (req, res) => {
+  const { userId } = req.params;
+  const prefix = `${userId}:`;
+  const results = [];
+
+  for (const [key, order] of orderStore) {
+    if (key.startsWith(prefix)) {
+      results.push({ ...order, request_id: req.requestId });
+    }
+  }
+
+  res.json({
+    user_id: userId,
+    count: results.length,
+    orders: results,
+    request_id: req.requestId,
+  });
+});
+
+// PUT /users/:userId/profile — Create/Update Profile
+app.put("/users/:userId/profile", (req, res) => {
+  const { userId } = req.params;
+  const profile = { ...req.body, user_id: userId, request_id: req.requestId };
+  profileStore.set(userId, profile);
+  res.json(profile);
+});
+
+// GET /users/:userId/profile — Get Profile
+app.get("/users/:userId/profile", (req, res) => {
+  const { userId } = req.params;
+
+  if (!profileStore.has(userId)) {
+    return res.status(404).json({ error: "profile not found" });
+  }
+
+  const profile = { ...profileStore.get(userId), request_id: req.requestId };
+  res.json(profile);
 });
 
 // ── Start server ─────────────────────────────────────────────────────

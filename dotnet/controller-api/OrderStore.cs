@@ -18,4 +18,25 @@ public class OrderStore
     public bool Contains(string key) => _store.ContainsKey(key);
 
     public bool TryRemove(string key) => _store.TryRemove(key, out _);
+
+    public List<OrderResponse> GetByUser(string userId)
+    {
+        var prefix = $"{userId}:";
+        var results = new List<OrderResponse>();
+        foreach (var kvp in _store)
+        {
+            if (kvp.Key.StartsWith(prefix))
+                results.Add(kvp.Value);
+        }
+        return results;
+    }
+}
+
+public class ProfileStore
+{
+    private readonly ConcurrentDictionary<string, UserProfile> _store = new();
+
+    public void Set(string userId, UserProfile profile) => _store[userId] = profile;
+
+    public bool TryGet(string userId, out UserProfile? profile) => _store.TryGetValue(userId, out profile);
 }

@@ -9,6 +9,7 @@ builder.Logging.ClearProviders();
 
 builder.Services.AddCarter();
 builder.Services.AddSingleton<OrderStore>();
+builder.Services.AddSingleton<ProfileStore>();
 
 builder.Services.AddCors(options =>
 {
@@ -199,6 +200,81 @@ public class OrdersModule : ICarterModule
 
             return Results.Ok(result);
         });
+
+        app.MapPost("/users/{userId}/orders/bulk", (HttpContext ctx, string userId, BulkCreateOrderReq req, OrderStore store) =>
+        {
+            var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
+            var results = new List<OrderResponse>();
+            var totalSum = 0.0;
+
+            foreach (var item in req.Orders ?? [])
+            {
+                var total = 0.0;
+                foreach (var i in item.Items ?? [])
+                    total += i.Price * i.Quantity;
+
+                var orderId = store.NextOrderId();
+                var order = new OrderResponse
+                {
+                    OrderId = orderId,
+                    UserId = userId,
+                    Status = "created",
+                    Items = item.Items ?? [],
+                    Total = total,
+                    Currency = string.IsNullOrEmpty(item.Currency) ? "USD" : item.Currency,
+                    Fields = "",
+                    RequestId = requestId
+                };
+
+                store.Set(OrderStore.Key(userId, orderId), order);
+                results.Add(order);
+                totalSum += total;
+            }
+
+            return Results.Created($"/users/{userId}/orders", new BulkOrderResponse
+            {
+                UserId = userId,
+                Count = results.Count,
+                Orders = results,
+                TotalSum = totalSum,
+                RequestId = requestId
+            });
+        });
+
+        app.MapGet("/users/{userId}/orders", (HttpContext ctx, string userId, OrderStore store) =>
+        {
+            var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
+            var orders = store.GetByUser(userId);
+            foreach (var o in orders)
+                o.RequestId = requestId;
+
+            return Results.Ok(new ListOrdersResponse
+            {
+                UserId = userId,
+                Count = orders.Count,
+                Orders = orders,
+                RequestId = requestId
+            });
+        });
+
+        app.MapPut("/users/{userId}/profile", (HttpContext ctx, string userId, UserProfile profile, ProfileStore profileStore) =>
+        {
+            var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
+            profile.UserId = userId;
+            profile.RequestId = requestId;
+            profileStore.Set(userId, profile);
+            return Results.Ok(profile);
+        });
+
+        app.MapGet("/users/{userId}/profile", (HttpContext ctx, string userId, ProfileStore profileStore) =>
+        {
+            var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
+            if (!profileStore.TryGet(userId, out var profile) || profile is null)
+                return Results.Json(new { error = "profile not found" }, statusCode: 404);
+
+            profile.RequestId = requestId;
+            return Results.Ok(profile);
+        });
     }
 }
 
@@ -215,6 +291,27 @@ public class OrderStore
     public bool TryGet(string key, out OrderResponse? order) => _store.TryGetValue(key, out order);
     public bool Contains(string key) => _store.ContainsKey(key);
     public bool TryRemove(string key) => _store.TryRemove(key, out _);
+
+    public List<OrderResponse> GetByUser(string userId)
+    {
+        var prefix = $"{userId}:";
+        var results = new List<OrderResponse>();
+        foreach (var kvp in _store)
+        {
+            if (kvp.Key.StartsWith(prefix))
+                results.Add(kvp.Value);
+        }
+        return results;
+    }
+}
+
+public class ProfileStore
+{
+    private readonly ConcurrentDictionary<string, UserProfile> _store = new();
+
+    public void Set(string userId, UserProfile profile) => _store[userId] = profile;
+
+    public bool TryGet(string userId, out UserProfile? profile) => _store.TryGetValue(userId, out profile);
 }
 
 public static class Helpers
@@ -284,4 +381,112 @@ public class OrderResponse
     public string Fields { get; set; } = "";
     [JsonPropertyName("request_id")]
     public string RequestId { get; set; } = "";
+}
+
+public class BulkCreateOrderReq
+{
+    [JsonPropertyName("orders")]
+    public List<CreateOrderReq> Orders { get; set; } = [];
+}
+
+public class BulkOrderResponse
+{
+    [JsonPropertyName("user_id")]
+    public string UserId { get; set; } = "";
+    [JsonPropertyName("count")]
+    public int Count { get; set; }
+    [JsonPropertyName("orders")]
+    public List<OrderResponse> Orders { get; set; } = [];
+    [JsonPropertyName("total_sum")]
+    public double TotalSum { get; set; }
+    [JsonPropertyName("request_id")]
+    public string RequestId { get; set; } = "";
+}
+
+public class ListOrdersResponse
+{
+    [JsonPropertyName("user_id")]
+    public string UserId { get; set; } = "";
+    [JsonPropertyName("count")]
+    public int Count { get; set; }
+    [JsonPropertyName("orders")]
+    public List<OrderResponse> Orders { get; set; } = [];
+    [JsonPropertyName("request_id")]
+    public string RequestId { get; set; } = "";
+}
+
+public class UserProfile
+{
+    [JsonPropertyName("user_id")]
+    public string UserId { get; set; } = "";
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+    [JsonPropertyName("email")]
+    public string Email { get; set; } = "";
+    [JsonPropertyName("phone")]
+    public string Phone { get; set; } = "";
+    [JsonPropertyName("address")]
+    public Address Address { get; set; } = new();
+    [JsonPropertyName("preferences")]
+    public Preferences Preferences { get; set; } = new();
+    [JsonPropertyName("payment_methods")]
+    public List<PaymentMethod> PaymentMethods { get; set; } = [];
+    [JsonPropertyName("tags")]
+    public List<string> Tags { get; set; } = [];
+    [JsonPropertyName("metadata")]
+    public Dictionary<string, string> Metadata { get; set; } = new();
+    [JsonPropertyName("request_id")]
+    public string RequestId { get; set; } = "";
+}
+
+public class Address
+{
+    [JsonPropertyName("street")]
+    public string Street { get; set; } = "";
+    [JsonPropertyName("city")]
+    public string City { get; set; } = "";
+    [JsonPropertyName("state")]
+    public string State { get; set; } = "";
+    [JsonPropertyName("zip")]
+    public string Zip { get; set; } = "";
+    [JsonPropertyName("country")]
+    public string Country { get; set; } = "";
+}
+
+public class Preferences
+{
+    [JsonPropertyName("language")]
+    public string Language { get; set; } = "";
+    [JsonPropertyName("currency")]
+    public string Currency { get; set; } = "";
+    [JsonPropertyName("timezone")]
+    public string Timezone { get; set; } = "";
+    [JsonPropertyName("notifications")]
+    public NotificationPrefs Notifications { get; set; } = new();
+    [JsonPropertyName("theme")]
+    public string Theme { get; set; } = "";
+}
+
+public class NotificationPrefs
+{
+    [JsonPropertyName("email")]
+    public bool Email { get; set; }
+    [JsonPropertyName("sms")]
+    public bool Sms { get; set; }
+    [JsonPropertyName("push")]
+    public bool Push { get; set; }
+}
+
+public class PaymentMethod
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "";
+    [JsonPropertyName("last4")]
+    public string Last4 { get; set; } = "";
+    [JsonPropertyName("expiry_month")]
+    public int ExpiryMonth { get; set; }
+    [JsonPropertyName("expiry_year")]
+    public int ExpiryYear { get; set; }
+    [JsonPropertyName("is_default")]
+    public bool IsDefault { get; set; }
 }

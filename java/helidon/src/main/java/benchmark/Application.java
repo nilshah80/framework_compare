@@ -12,6 +12,7 @@ import io.helidon.webserver.http.ServerResponse;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.*;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -19,6 +20,7 @@ public class Application {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final ConcurrentHashMap<String, OrderResponse> store = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, UserProfile> profileStore = new ConcurrentHashMap<>();
     private static final AtomicLong counter = new AtomicLong(0);
 
     private static final Set<String> SENSITIVE_HEADERS = Set.of(
@@ -50,6 +52,36 @@ public class Application {
 
     public record ErrorResponse(String error) {}
 
+    public record BulkOrderRequest(List<OrderRequest> orders) {}
+
+    public record BulkOrderResponse(
+            @JsonProperty("user_id") String userId,
+            int count,
+            List<OrderResponse> orders,
+            @JsonProperty("total_sum") double totalSum,
+            @JsonProperty("request_id") String requestId) {}
+
+    public record Address(String street, String city, String state, String zip, String country) {}
+
+    public record NotificationPrefs(boolean email, boolean sms, boolean push) {}
+
+    public record Preferences(String language, String currency, String timezone,
+                              NotificationPrefs notifications, String theme) {}
+
+    public record PaymentMethod(String type, String last4,
+                                @JsonProperty("expiry_month") int expiryMonth,
+                                @JsonProperty("expiry_year") int expiryYear,
+                                @JsonProperty("is_default") boolean isDefault) {}
+
+    public record UserProfile(
+            @JsonProperty("user_id") String userId,
+            String name, String email, String phone,
+            Address address, Preferences preferences,
+            @JsonProperty("payment_methods") List<PaymentMethod> paymentMethods,
+            List<String> tags,
+            Map<String, String> metadata,
+            @JsonProperty("request_id") String requestId) {}
+
     // --- Main ---
 
     public static void main(String[] args) {
@@ -64,10 +96,14 @@ public class Application {
 
     private static void routing(HttpRouting.Builder routing) {
         routing.any(Application::middlewareHandler)
+                .post("/users/{userId}/orders/bulk", Application::bulkCreateOrders)
                 .post("/users/{userId}/orders", Application::createOrder)
                 .put("/users/{userId}/orders/{orderId}", Application::updateOrder)
                 .delete("/users/{userId}/orders/{orderId}", Application::deleteOrder)
                 .get("/users/{userId}/orders/{orderId}", Application::getOrder)
+                .get("/users/{userId}/orders", Application::listOrders)
+                .put("/users/{userId}/profile", Application::putProfile)
+                .get("/users/{userId}/profile", Application::getProfile)
                 .error(Exception.class, Application::errorHandler);
     }
 
@@ -217,6 +253,98 @@ public class Application {
             var result = new OrderResponse(existing.orderId(), existing.userId(), existing.status(),
                     existing.items(), existing.total(), existing.currency(), fields, requestId);
             sendJson(req, res, 200, result);
+        } catch (Exception e) {
+            errorHandler(req, res, e);
+        }
+    }
+
+    private static void bulkCreateOrders(ServerRequest req, ServerResponse res) {
+        try {
+            String userId = req.path().pathParameters().get("userId");
+            String requestId = req.context().get("requestId", String.class).orElse("");
+            String bodyStr = req.content().as(String.class);
+            BulkOrderRequest body = MAPPER.readValue(bodyStr, BulkOrderRequest.class);
+
+            List<OrderResponse> results = new ArrayList<>();
+            double totalSum = 0;
+
+            for (var orderReq : body.orders()) {
+                String orderId = String.valueOf(counter.incrementAndGet());
+                double total = 0;
+                if (orderReq.items() != null) {
+                    for (var item : orderReq.items()) {
+                        total += item.price() * item.quantity();
+                    }
+                }
+                String currency = (orderReq.currency() == null || orderReq.currency().isBlank()) ? "USD" : orderReq.currency();
+                var order = new OrderResponse(orderId, userId, "created", orderReq.items(), total, currency, null, requestId);
+                store.put(userId + ":" + orderId, order);
+                results.add(order);
+                totalSum += total;
+            }
+
+            sendJson(req, res, 201, new BulkOrderResponse(userId, results.size(), results, totalSum, requestId));
+        } catch (Exception e) {
+            errorHandler(req, res, e);
+        }
+    }
+
+    private static void listOrders(ServerRequest req, ServerResponse res) {
+        try {
+            String userId = req.path().pathParameters().get("userId");
+            String requestId = req.context().get("requestId", String.class).orElse("");
+            String prefix = userId + ":";
+            List<OrderResponse> results = new ArrayList<>();
+
+            store.forEach((key, value) -> {
+                if (key.startsWith(prefix)) {
+                    results.add(value);
+                }
+            });
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("user_id", userId);
+            response.put("count", results.size());
+            response.put("orders", results);
+            response.put("request_id", requestId);
+
+            sendJson(req, res, 200, response);
+        } catch (Exception e) {
+            errorHandler(req, res, e);
+        }
+    }
+
+    private static void putProfile(ServerRequest req, ServerResponse res) {
+        try {
+            String userId = req.path().pathParameters().get("userId");
+            String requestId = req.context().get("requestId", String.class).orElse("");
+            String bodyStr = req.content().as(String.class);
+            UserProfile body = MAPPER.readValue(bodyStr, UserProfile.class);
+
+            var profile = new UserProfile(userId, body.name(), body.email(), body.phone(),
+                body.address(), body.preferences(), body.paymentMethods(), body.tags(), body.metadata(), requestId);
+            profileStore.put(userId, profile);
+
+            sendJson(req, res, 200, profile);
+        } catch (Exception e) {
+            errorHandler(req, res, e);
+        }
+    }
+
+    private static void getProfile(ServerRequest req, ServerResponse res) {
+        try {
+            String userId = req.path().pathParameters().get("userId");
+            String requestId = req.context().get("requestId", String.class).orElse("");
+
+            UserProfile profile = profileStore.get(userId);
+            if (profile == null) {
+                sendJson(req, res, 404, new ErrorResponse("profile not found"));
+                return;
+            }
+
+            var withReqId = new UserProfile(profile.userId(), profile.name(), profile.email(), profile.phone(),
+                profile.address(), profile.preferences(), profile.paymentMethods(), profile.tags(), profile.metadata(), requestId);
+            sendJson(req, res, 200, withReqId);
         } catch (Exception e) {
             errorHandler(req, res, e);
         }

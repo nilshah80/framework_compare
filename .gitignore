@@ -11,6 +11,7 @@ go/echo/echo
 go/fiber/fiber
 go/gin/gin
 go/mach/mach
+go/chi/chi
 *.exe
 *.exe~
 *.dll

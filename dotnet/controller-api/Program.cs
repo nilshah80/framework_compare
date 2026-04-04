@@ -7,6 +7,7 @@ builder.Logging.ClearProviders();
 
 builder.Services.AddControllers();
 builder.Services.AddSingleton<OrderStore>();
+builder.Services.AddSingleton<ProfileStore>();
 
 builder.Services.AddCors(options =>
 {

@@ -1,13 +1,14 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use uuid::Uuid;
-use warp::http::{HeaderMap, HeaderValue, Response, StatusCode};
+use warp::http::{HeaderMap, Response, StatusCode};
 use warp::hyper::body::Bytes;
-use warp::{reject, reply, Filter, Rejection, Reply};
+use warp::{Filter, Rejection, Reply};
 
 // ─── Models ───
 
@@ -59,10 +60,111 @@ struct GetOrderQuery {
     fields: Option<String>,
 }
 
+// ─── Bulk Orders types ───
+
+#[derive(Debug, Clone, Deserialize)]
+struct BulkCreateOrderReq {
+    orders: Vec<OrderRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BulkOrderResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    total_sum: f64,
+    request_id: String,
+}
+
+// ─── List Orders response ───
+
+#[derive(Debug, Clone, Serialize)]
+struct ListOrdersResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    request_id: String,
+}
+
+// ─── User Profile types ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserProfile {
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    phone: String,
+    #[serde(default)]
+    address: WarpAddress,
+    #[serde(default)]
+    preferences: WarpPreferences,
+    #[serde(default)]
+    payment_methods: Vec<PaymentMethod>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+    #[serde(default)]
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WarpAddress {
+    #[serde(default)]
+    street: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    zip: String,
+    #[serde(default)]
+    country: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WarpPreferences {
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    notifications: NotificationPrefs,
+    #[serde(default)]
+    theme: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotificationPrefs {
+    #[serde(default)]
+    email: bool,
+    #[serde(default)]
+    sms: bool,
+    #[serde(default)]
+    push: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaymentMethod {
+    #[serde(rename = "type")]
+    type_: String,
+    last4: String,
+    expiry_month: i32,
+    expiry_year: i32,
+    is_default: bool,
+}
+
 // ─── Store ───
 
 struct AppState {
     store: DashMap<String, StoredOrder>,
+    profiles: DashMap<String, UserProfile>,
     next_id: AtomicU64,
 }
 
@@ -74,16 +176,6 @@ struct StoredOrder {
     total: f64,
     currency: String,
 }
-
-// ─── Custom rejection for 404 ───
-
-#[derive(Debug)]
-struct OrderNotFound;
-impl reject::Reject for OrderNotFound {}
-
-#[derive(Debug)]
-struct BodyTooLarge;
-impl reject::Reject for BodyTooLarge {}
 
 // ─── PII Redaction ───
 
@@ -391,6 +483,209 @@ async fn handle_get_order(
     }
 }
 
+// ─── Bulk + List + Profile Handlers ───
+
+async fn handle_bulk_create_orders(
+    user_id: String,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+    state: Arc<AppState>,
+) -> Result<impl Reply, Rejection> {
+    let start = Instant::now();
+    let request_id = extract_request_id(&headers);
+
+    if body_bytes.len() > 1_048_576 {
+        let resp = json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &ErrorResponse {
+                error: "Payload too large".to_string(),
+            },
+            &request_id,
+        );
+        log_request("POST", &format!("/users/{}/orders/bulk", user_id), "", &headers, &request_id, &resp, start);
+        return Ok(resp);
+    }
+
+    let body: BulkCreateOrderReq = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            let resp = json_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: "invalid JSON".to_string(),
+                },
+                &request_id,
+            );
+            log_request("POST", &format!("/users/{}/orders/bulk", user_id), "", &headers, &request_id, &resp, start);
+            return Ok(resp);
+        }
+    };
+
+    let mut results = Vec::new();
+    let mut total_sum = 0.0;
+
+    for order_req in &body.orders {
+        let id = state.next_id.fetch_add(1, Ordering::SeqCst);
+        let order_id = id.to_string();
+        let total: f64 = order_req.items.iter().map(|i| i.price * i.quantity as f64).sum();
+        let currency = if order_req.currency.is_empty() {
+            "USD".to_string()
+        } else {
+            order_req.currency.clone()
+        };
+
+        let stored = StoredOrder {
+            order_id: order_id.clone(),
+            user_id: user_id.clone(),
+            items: order_req.items.clone(),
+            total,
+            currency: currency.clone(),
+        };
+        state.store.insert(format!("{}:{}", user_id, order_id), stored);
+
+        results.push(OrderResponse {
+            order_id,
+            user_id: user_id.clone(),
+            status: "created".to_string(),
+            items: order_req.items.clone(),
+            total,
+            currency,
+            fields: "*".to_string(),
+            request_id: request_id.clone(),
+        });
+        total_sum += total;
+    }
+
+    let bulk_resp = BulkOrderResponse {
+        user_id: user_id.clone(),
+        count: results.len(),
+        orders: results,
+        total_sum,
+        request_id: request_id.clone(),
+    };
+
+    let resp = json_response(StatusCode::CREATED, &bulk_resp, &request_id);
+    log_request("POST", &format!("/users/{}/orders/bulk", user_id), "", &headers, &request_id, &resp, start);
+    Ok(resp)
+}
+
+async fn handle_list_orders(
+    user_id: String,
+    headers: HeaderMap,
+    state: Arc<AppState>,
+) -> Result<impl Reply, Rejection> {
+    let start = Instant::now();
+    let request_id = extract_request_id(&headers);
+    let prefix = format!("{}:", user_id);
+    let path = format!("/users/{}/orders", user_id);
+
+    let mut results = Vec::new();
+    for entry in state.store.iter() {
+        if entry.key().starts_with(&prefix) {
+            let stored = entry.value();
+            results.push(OrderResponse {
+                order_id: stored.order_id.clone(),
+                user_id: stored.user_id.clone(),
+                status: "created".to_string(),
+                items: stored.items.clone(),
+                total: stored.total,
+                currency: stored.currency.clone(),
+                fields: "*".to_string(),
+                request_id: request_id.clone(),
+            });
+        }
+    }
+
+    let list_resp = ListOrdersResponse {
+        user_id,
+        count: results.len(),
+        orders: results,
+        request_id: request_id.clone(),
+    };
+
+    let resp = json_response(StatusCode::OK, &list_resp, &request_id);
+    log_request("GET", &path, "", &headers, &request_id, &resp, start);
+    Ok(resp)
+}
+
+async fn handle_put_profile(
+    user_id: String,
+    headers: HeaderMap,
+    body_bytes: Bytes,
+    state: Arc<AppState>,
+) -> Result<impl Reply, Rejection> {
+    let start = Instant::now();
+    let request_id = extract_request_id(&headers);
+    let path = format!("/users/{}/profile", user_id);
+
+    if body_bytes.len() > 1_048_576 {
+        let resp = json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &ErrorResponse {
+                error: "Payload too large".to_string(),
+            },
+            &request_id,
+        );
+        log_request("PUT", &path, "", &headers, &request_id, &resp, start);
+        return Ok(resp);
+    }
+
+    let mut profile: UserProfile = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            let resp = json_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse {
+                    error: "invalid JSON".to_string(),
+                },
+                &request_id,
+            );
+            log_request("PUT", &path, "", &headers, &request_id, &resp, start);
+            return Ok(resp);
+        }
+    };
+
+    profile.user_id = user_id.clone();
+    profile.request_id = request_id.clone();
+
+    state.profiles.insert(user_id, profile.clone());
+
+    let resp = json_response(StatusCode::OK, &profile, &request_id);
+    log_request("PUT", &path, "", &headers, &request_id, &resp, start);
+    Ok(resp)
+}
+
+async fn handle_get_profile(
+    user_id: String,
+    headers: HeaderMap,
+    state: Arc<AppState>,
+) -> Result<impl Reply, Rejection> {
+    let start = Instant::now();
+    let request_id = extract_request_id(&headers);
+    let path = format!("/users/{}/profile", user_id);
+
+    match state.profiles.get(&user_id) {
+        Some(entry) => {
+            let mut profile = entry.value().clone();
+            profile.request_id = request_id.clone();
+            let resp = json_response(StatusCode::OK, &profile, &request_id);
+            log_request("GET", &path, "", &headers, &request_id, &resp, start);
+            Ok(resp)
+        }
+        None => {
+            let resp = json_response(
+                StatusCode::NOT_FOUND,
+                &ErrorResponse {
+                    error: "profile not found".to_string(),
+                },
+                &request_id,
+            );
+            log_request("GET", &path, "", &headers, &request_id, &resp, start);
+            Ok(resp)
+        }
+    }
+}
+
 // ─── Structured Logger ───
 
 fn log_request(
@@ -478,6 +773,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
 async fn main() {
     let state = Arc::new(AppState {
         store: DashMap::new(),
+        profiles: DashMap::new(),
         next_id: AtomicU64::new(1),
     });
 
@@ -532,6 +828,49 @@ async fn main() {
         .and(state_filter.clone())
         .and_then(handle_get_order);
 
+    // POST /users/{userId}/orders/bulk
+    let bulk_create = warp::post()
+        .and(warp::path("users"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("orders"))
+        .and(warp::path("bulk"))
+        .and(warp::path::end())
+        .and(warp::header::headers_cloned())
+        .and(warp::body::bytes())
+        .and(state_filter.clone())
+        .and_then(handle_bulk_create_orders);
+
+    // GET /users/{userId}/orders
+    let list = warp::get()
+        .and(warp::path("users"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("orders"))
+        .and(warp::path::end())
+        .and(warp::header::headers_cloned())
+        .and(state_filter.clone())
+        .and_then(handle_list_orders);
+
+    // PUT /users/{userId}/profile
+    let put_profile = warp::put()
+        .and(warp::path("users"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("profile"))
+        .and(warp::path::end())
+        .and(warp::header::headers_cloned())
+        .and(warp::body::bytes())
+        .and(state_filter.clone())
+        .and_then(handle_put_profile);
+
+    // GET /users/{userId}/profile
+    let get_profile = warp::get()
+        .and(warp::path("users"))
+        .and(warp::path::param::<String>())
+        .and(warp::path("profile"))
+        .and(warp::path::end())
+        .and(warp::header::headers_cloned())
+        .and(state_filter.clone())
+        .and_then(handle_get_profile);
+
     // OPTIONS preflight
     let options = warp::options().map(|| {
         Response::builder()
@@ -549,10 +888,14 @@ async fn main() {
             .unwrap()
     });
 
-    let routes = create
+    let routes = bulk_create
+        .or(create)
+        .or(list)
         .or(update)
         .or(delete)
         .or(get)
+        .or(put_profile)
+        .or(get_profile)
         .or(options)
         .recover(handle_rejection);
 

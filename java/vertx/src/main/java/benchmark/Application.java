@@ -12,6 +12,7 @@ import io.vertx.ext.web.handler.BodyHandler;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.*;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -19,6 +20,7 @@ public class Application {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final ConcurrentHashMap<String, OrderResponse> store = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, UserProfile> profileStore = new ConcurrentHashMap<>();
     private static final AtomicLong counter = new AtomicLong(0);
 
     private static final Set<String> SENSITIVE_HEADERS = Set.of(
@@ -49,6 +51,36 @@ public class Application {
             @JsonProperty("request_id") String requestId) {}
 
     public record ErrorResponse(String error) {}
+
+    public record BulkOrderRequest(List<OrderRequest> orders) {}
+
+    public record BulkOrderResponse(
+            @JsonProperty("user_id") String userId,
+            int count,
+            List<OrderResponse> orders,
+            @JsonProperty("total_sum") double totalSum,
+            @JsonProperty("request_id") String requestId) {}
+
+    public record Address(String street, String city, String state, String zip, String country) {}
+
+    public record NotificationPrefs(boolean email, boolean sms, boolean push) {}
+
+    public record Preferences(String language, String currency, String timezone,
+                              NotificationPrefs notifications, String theme) {}
+
+    public record PaymentMethod(String type, String last4,
+                                @JsonProperty("expiry_month") int expiryMonth,
+                                @JsonProperty("expiry_year") int expiryYear,
+                                @JsonProperty("is_default") boolean isDefault) {}
+
+    public record UserProfile(
+            @JsonProperty("user_id") String userId,
+            String name, String email, String phone,
+            Address address, Preferences preferences,
+            @JsonProperty("payment_methods") List<PaymentMethod> paymentMethods,
+            List<String> tags,
+            Map<String, String> metadata,
+            @JsonProperty("request_id") String requestId) {}
 
     // --- Main ---
 
@@ -81,10 +113,14 @@ public class Application {
         // Routes
         String basePath = "/users/:userId/orders";
 
+        router.post(basePath + "/bulk").handler(Application::bulkCreateOrders);
         router.post(basePath).handler(Application::createOrder);
         router.put(basePath + "/:orderId").handler(Application::updateOrder);
         router.delete(basePath + "/:orderId").handler(Application::deleteOrder);
         router.get(basePath + "/:orderId").handler(Application::getOrder);
+        router.get(basePath).handler(Application::listOrders);
+        router.put("/users/:userId/profile").handler(Application::putProfile);
+        router.get("/users/:userId/profile").handler(Application::getProfile);
 
         // After-handler for structured logging
         router.route().last().handler(ctx -> ctx.next());
@@ -233,6 +269,96 @@ public class Application {
             var result = new OrderResponse(existing.orderId(), existing.userId(), existing.status(),
                     existing.items(), existing.total(), existing.currency(), fields, requestId);
             sendJson(ctx, 200, result);
+        } catch (Exception e) {
+            ctx.fail(e);
+        }
+    }
+
+    private static void bulkCreateOrders(RoutingContext ctx) {
+        try {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.get("requestId");
+            BulkOrderRequest body = MAPPER.readValue(ctx.body().asString(), BulkOrderRequest.class);
+
+            List<OrderResponse> results = new ArrayList<>();
+            double totalSum = 0;
+
+            for (var orderReq : body.orders()) {
+                String orderId = String.valueOf(counter.incrementAndGet());
+                double total = 0;
+                if (orderReq.items() != null) {
+                    for (var item : orderReq.items()) {
+                        total += item.price() * item.quantity();
+                    }
+                }
+                String currency = (orderReq.currency() == null || orderReq.currency().isBlank()) ? "USD" : orderReq.currency();
+                var order = new OrderResponse(orderId, userId, "created", orderReq.items(), total, currency, null, requestId);
+                store.put(userId + ":" + orderId, order);
+                results.add(order);
+                totalSum += total;
+            }
+
+            sendJson(ctx, 201, new BulkOrderResponse(userId, results.size(), results, totalSum, requestId));
+        } catch (Exception e) {
+            ctx.fail(e);
+        }
+    }
+
+    private static void listOrders(RoutingContext ctx) {
+        try {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.get("requestId");
+            String prefix = userId + ":";
+            List<OrderResponse> results = new ArrayList<>();
+
+            store.forEach((key, value) -> {
+                if (key.startsWith(prefix)) {
+                    results.add(value);
+                }
+            });
+
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("user_id", userId);
+            response.put("count", results.size());
+            response.put("orders", results);
+            response.put("request_id", requestId);
+
+            sendJson(ctx, 200, response);
+        } catch (Exception e) {
+            ctx.fail(e);
+        }
+    }
+
+    private static void putProfile(RoutingContext ctx) {
+        try {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.get("requestId");
+            UserProfile body = MAPPER.readValue(ctx.body().asString(), UserProfile.class);
+
+            var profile = new UserProfile(userId, body.name(), body.email(), body.phone(),
+                body.address(), body.preferences(), body.paymentMethods(), body.tags(), body.metadata(), requestId);
+            profileStore.put(userId, profile);
+
+            sendJson(ctx, 200, profile);
+        } catch (Exception e) {
+            ctx.fail(e);
+        }
+    }
+
+    private static void getProfile(RoutingContext ctx) {
+        try {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.get("requestId");
+
+            UserProfile profile = profileStore.get(userId);
+            if (profile == null) {
+                sendJson(ctx, 404, new ErrorResponse("profile not found"));
+                return;
+            }
+
+            var withReqId = new UserProfile(profile.userId(), profile.name(), profile.email(), profile.phone(),
+                profile.address(), profile.preferences(), profile.paymentMethods(), profile.tags(), profile.metadata(), requestId);
+            sendJson(ctx, 200, withReqId);
         } catch (Exception e) {
             ctx.fail(e);
         }

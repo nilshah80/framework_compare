@@ -13,8 +13,8 @@
         <java.version>21</java.version>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
-        <vertx.version>4.5.11</vertx.version>
-        <jackson.version>2.18.1</jackson.version>
+        <vertx.version>4.5.13</vertx.version>
+        <jackson.version>2.18.3</jackson.version>
         <main.class>benchmark.Application</main.class>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     </properties>

@@ -52,3 +52,141 @@ public class OrderResponse
     [JsonPropertyName("request_id")]
     public string RequestId { get; set; } = "";
 }
+
+public class BulkCreateOrderReq
+{
+    [JsonPropertyName("orders")]
+    public List<CreateOrderReq> Orders { get; set; } = [];
+}
+
+public class BulkOrderResponse
+{
+    [JsonPropertyName("user_id")]
+    public string UserId { get; set; } = "";
+
+    [JsonPropertyName("count")]
+    public int Count { get; set; }
+
+    [JsonPropertyName("orders")]
+    public List<OrderResponse> Orders { get; set; } = [];
+
+    [JsonPropertyName("total_sum")]
+    public double TotalSum { get; set; }
+
+    [JsonPropertyName("request_id")]
+    public string RequestId { get; set; } = "";
+}
+
+public class ListOrdersResponse
+{
+    [JsonPropertyName("user_id")]
+    public string UserId { get; set; } = "";
+
+    [JsonPropertyName("count")]
+    public int Count { get; set; }
+
+    [JsonPropertyName("orders")]
+    public List<OrderResponse> Orders { get; set; } = [];
+
+    [JsonPropertyName("request_id")]
+    public string RequestId { get; set; } = "";
+}
+
+public class UserProfile
+{
+    [JsonPropertyName("user_id")]
+    public string UserId { get; set; } = "";
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("email")]
+    public string Email { get; set; } = "";
+
+    [JsonPropertyName("phone")]
+    public string Phone { get; set; } = "";
+
+    [JsonPropertyName("address")]
+    public Address Address { get; set; } = new();
+
+    [JsonPropertyName("preferences")]
+    public Preferences Preferences { get; set; } = new();
+
+    [JsonPropertyName("payment_methods")]
+    public List<PaymentMethod> PaymentMethods { get; set; } = [];
+
+    [JsonPropertyName("tags")]
+    public List<string> Tags { get; set; } = [];
+
+    [JsonPropertyName("metadata")]
+    public Dictionary<string, string> Metadata { get; set; } = new();
+
+    [JsonPropertyName("request_id")]
+    public string RequestId { get; set; } = "";
+}
+
+public class Address
+{
+    [JsonPropertyName("street")]
+    public string Street { get; set; } = "";
+
+    [JsonPropertyName("city")]
+    public string City { get; set; } = "";
+
+    [JsonPropertyName("state")]
+    public string State { get; set; } = "";
+
+    [JsonPropertyName("zip")]
+    public string Zip { get; set; } = "";
+
+    [JsonPropertyName("country")]
+    public string Country { get; set; } = "";
+}
+
+public class Preferences
+{
+    [JsonPropertyName("language")]
+    public string Language { get; set; } = "";
+
+    [JsonPropertyName("currency")]
+    public string Currency { get; set; } = "";
+
+    [JsonPropertyName("timezone")]
+    public string Timezone { get; set; } = "";
+
+    [JsonPropertyName("notifications")]
+    public NotificationPrefs Notifications { get; set; } = new();
+
+    [JsonPropertyName("theme")]
+    public string Theme { get; set; } = "";
+}
+
+public class NotificationPrefs
+{
+    [JsonPropertyName("email")]
+    public bool Email { get; set; }
+
+    [JsonPropertyName("sms")]
+    public bool Sms { get; set; }
+
+    [JsonPropertyName("push")]
+    public bool Push { get; set; }
+}
+
+public class PaymentMethod
+{
+    [JsonPropertyName("type")]
+    public string Type { get; set; } = "";
+
+    [JsonPropertyName("last4")]
+    public string Last4 { get; set; } = "";
+
+    [JsonPropertyName("expiry_month")]
+    public int ExpiryMonth { get; set; }
+
+    [JsonPropertyName("expiry_year")]
+    public int ExpiryYear { get; set; }
+
+    [JsonPropertyName("is_default")]
+    public bool IsDefault { get; set; }
+}

@@ -9,6 +9,7 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.List;
 
 public class Application {
 
@@ -87,6 +88,67 @@ public class Application {
         });
 
         // Routes
+        app.post("/users/{userId}/orders/bulk", ctx -> {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.attribute("requestId");
+            BulkOrderRequest req = ctx.bodyAsClass(BulkOrderRequest.class);
+
+            List<OrderResponse> results = new ArrayList<>();
+            double totalSum = 0;
+
+            for (OrderRequest orderReq : req.getOrders()) {
+                String currency = (orderReq.getCurrency() == null || orderReq.getCurrency().isBlank()) ? "USD" : orderReq.getCurrency();
+                double total = orderReq.getItems().stream().mapToDouble(i -> i.getQuantity() * i.getPrice()).sum();
+                String orderId = String.valueOf(STORE.nextId());
+
+                OrderResponse order = new OrderResponse(orderId, userId, "created", orderReq.getItems(), total, currency, null, requestId);
+                STORE.put(userId, orderId, order);
+                results.add(order);
+                totalSum += total;
+            }
+
+            sendJson(ctx, 201, new BulkOrderResponse(userId, results.size(), results, totalSum, requestId));
+        });
+
+        app.get("/users/{userId}/orders", ctx -> {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.attribute("requestId");
+            List<OrderResponse> orders = STORE.listByUser(userId);
+
+            sendJson(ctx, 200, Map.of(
+                "user_id", userId,
+                "count", orders.size(),
+                "orders", orders,
+                "request_id", requestId != null ? requestId : ""
+            ));
+        });
+
+        app.put("/users/{userId}/profile", ctx -> {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.attribute("requestId");
+            UserProfile body = ctx.bodyAsClass(UserProfile.class);
+
+            body.setUserId(userId);
+            body.setRequestId(requestId);
+            STORE.putProfile(userId, body);
+
+            sendJson(ctx, 200, body);
+        });
+
+        app.get("/users/{userId}/profile", ctx -> {
+            String userId = ctx.pathParam("userId");
+            String requestId = ctx.attribute("requestId");
+            UserProfile profile = STORE.getProfile(userId);
+
+            if (profile == null) {
+                sendJson(ctx, 404, new ErrorResponse("profile not found"));
+                return;
+            }
+
+            profile.setRequestId(requestId);
+            sendJson(ctx, 200, profile);
+        });
+
         app.post("/users/{userId}/orders", ctx -> {
             String userId = ctx.pathParam("userId");
             String requestId = ctx.attribute("requestId");

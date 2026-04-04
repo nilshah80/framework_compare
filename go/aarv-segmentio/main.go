@@ -49,11 +49,72 @@ type OrderItem struct {
 	Price     float64 `json:"price"`
 }
 
+// --- Bulk Orders types ---
+
+type BulkCreateOrderReq struct {
+	Orders []CreateOrderReq `json:"orders"`
+}
+
+type BulkOrderResponse struct {
+	UserID    string          `json:"user_id"`
+	Count     int             `json:"count"`
+	Orders    []OrderResponse `json:"orders"`
+	TotalSum  float64         `json:"total_sum"`
+	RequestID string          `json:"request_id"`
+}
+
+// --- User Profile types (deeply nested) ---
+
+type UserProfile struct {
+	UserID      string            `json:"user_id"`
+	Name        string            `json:"name"`
+	Email       string            `json:"email"`
+	Phone       string            `json:"phone"`
+	Address     Address           `json:"address"`
+	Preferences Preferences       `json:"preferences"`
+	Payment     []PaymentMethod   `json:"payment_methods"`
+	Tags        []string          `json:"tags"`
+	Metadata    map[string]string `json:"metadata"`
+	RequestID   string            `json:"request_id"`
+}
+
+type Address struct {
+	Street  string `json:"street"`
+	City    string `json:"city"`
+	State   string `json:"state"`
+	Zip     string `json:"zip"`
+	Country string `json:"country"`
+}
+
+type Preferences struct {
+	Language      string            `json:"language"`
+	Currency      string            `json:"currency"`
+	Timezone      string            `json:"timezone"`
+	Notifications NotificationPrefs `json:"notifications"`
+	Theme         string            `json:"theme"`
+}
+
+type NotificationPrefs struct {
+	Email bool `json:"email"`
+	SMS   bool `json:"sms"`
+	Push  bool `json:"push"`
+}
+
+type PaymentMethod struct {
+	Type        string `json:"type"`
+	Last4       string `json:"last4"`
+	ExpiryMonth int    `json:"expiry_month"`
+	ExpiryYear  int    `json:"expiry_year"`
+	IsDefault   bool   `json:"is_default"`
+}
+
 // --- In-memory store ---
 
 var (
 	orderStore   = make(map[string]OrderResponse)
+	profileStore = make(map[string]UserProfile)
 	orderMu      sync.RWMutex
+	profileMu    sync.RWMutex
 	orderCounter int64
 	counterMu    sync.Mutex
 )
@@ -200,6 +261,110 @@ func main() {
 			order.RequestID = c.RequestID()
 			return c.JSON(http.StatusOK, order)
 		}))
+
+		// POST /users/{userId}/orders/bulk — bulk create orders
+		g.Post("/bulk", aarv.BindReq(func(c *aarv.Context, req BulkCreateOrderReq) error {
+			userID := c.Param("userId")
+			reqID := c.RequestID()
+
+			var results []OrderResponse
+			var totalSum float64
+
+			orderMu.Lock()
+			for _, item := range req.Orders {
+				orderID := nextOrderID()
+				var total float64
+				for _, i := range item.Items {
+					total += i.Price * float64(i.Quantity)
+				}
+				currency := item.Currency
+				if currency == "" {
+					currency = "USD"
+				}
+				order := OrderResponse{
+					OrderID:   orderID,
+					UserID:    userID,
+					Status:    "created",
+					Items:     item.Items,
+					Total:     total,
+					Currency:  currency,
+					RequestID: reqID,
+				}
+				orderStore[storeKey(userID, orderID)] = order
+				results = append(results, order)
+				totalSum += total
+			}
+			orderMu.Unlock()
+
+			return c.JSON(http.StatusCreated, BulkOrderResponse{
+				UserID:    userID,
+				Count:     len(results),
+				Orders:    results,
+				TotalSum:  totalSum,
+				RequestID: reqID,
+			})
+		}))
+
+		// GET /users/{userId}/orders — list all orders for user
+		g.Get("", func(c *aarv.Context) error {
+			userID := c.Param("userId")
+			reqID := c.RequestID()
+
+			prefix := userID + ":"
+			var results []OrderResponse
+
+			orderMu.RLock()
+			for key, order := range orderStore {
+				if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+					order.RequestID = reqID
+					results = append(results, order)
+				}
+			}
+			orderMu.RUnlock()
+
+			return c.JSON(http.StatusOK, map[string]any{
+				"user_id":    userID,
+				"count":      len(results),
+				"orders":     results,
+				"request_id": reqID,
+			})
+		})
+	})
+
+	// Profile routes: /users/{userId}/profile
+	app.Put("/users/{userId}/profile", func(c *aarv.Context) error {
+		userID := c.Param("userId")
+		reqID := c.RequestID()
+
+		var profile UserProfile
+		if err := c.BindJSON(&profile); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		}
+
+		profile.UserID = userID
+		profile.RequestID = reqID
+
+		profileMu.Lock()
+		profileStore[userID] = profile
+		profileMu.Unlock()
+
+		return c.JSON(http.StatusOK, profile)
+	})
+
+	app.Get("/users/{userId}/profile", func(c *aarv.Context) error {
+		userID := c.Param("userId")
+		reqID := c.RequestID()
+
+		profileMu.RLock()
+		profile, ok := profileStore[userID]
+		profileMu.RUnlock()
+
+		if !ok {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "profile not found"})
+		}
+
+		profile.RequestID = reqID
+		return c.JSON(http.StatusOK, profile)
 	})
 
 	slog.Info("server starting", slog.String("port", "8086"))

@@ -1,15 +1,16 @@
 use axum::{
-    body::{Body, Bytes},
+    body::Body,
     extract::{Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{delete, get, post, put},
+    routing::{post, put},
     Json, Router,
 };
 use dashmap::DashMap;
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -60,10 +61,111 @@ struct ErrorResp {
     request_id: Option<String>,
 }
 
+// ─── Bulk Orders types ───
+
+#[derive(Debug, Clone, Deserialize)]
+struct BulkCreateOrderReq {
+    orders: Vec<CreateOrderReq>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BulkOrderResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    total_sum: f64,
+    request_id: String,
+}
+
+// ─── List Orders response ───
+
+#[derive(Debug, Clone, Serialize)]
+struct ListOrdersResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    request_id: String,
+}
+
+// ─── User Profile types ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserProfile {
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    phone: String,
+    #[serde(default)]
+    address: Address,
+    #[serde(default)]
+    preferences: Preferences,
+    #[serde(default)]
+    payment_methods: Vec<PaymentMethod>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+    #[serde(default)]
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Address {
+    #[serde(default)]
+    street: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    zip: String,
+    #[serde(default)]
+    country: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Preferences {
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    notifications: NotificationPrefs,
+    #[serde(default)]
+    theme: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotificationPrefs {
+    #[serde(default)]
+    email: bool,
+    #[serde(default)]
+    sms: bool,
+    #[serde(default)]
+    push: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaymentMethod {
+    #[serde(rename = "type")]
+    type_: String,
+    last4: String,
+    expiry_month: i32,
+    expiry_year: i32,
+    is_default: bool,
+}
+
 // ─── Store ───
 
 struct AppState {
     store: DashMap<String, OrderResponse>,
+    profiles: DashMap<String, UserProfile>,
     counter: AtomicU64,
 }
 
@@ -71,6 +173,7 @@ impl AppState {
     fn new() -> Self {
         Self {
             store: DashMap::new(),
+            profiles: DashMap::new(),
             counter: AtomicU64::new(0),
         }
     }
@@ -531,6 +634,167 @@ async fn get_order(
     }
 }
 
+// ─── Bulk + List + Profile Handlers ───
+
+async fn bulk_create_orders(
+    Path(user_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let request_id = get_request_id_from_ext(req.extensions());
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body: BulkCreateOrderReq = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut results = Vec::new();
+    let mut total_sum = 0.0;
+
+    for order_req in &body.orders {
+        let order_id = state.next_order_id();
+        let mut total = 0.0;
+        for item in &order_req.items {
+            total += item.price * item.quantity as f64;
+        }
+        let currency = if order_req.currency.is_empty() {
+            "USD".to_string()
+        } else {
+            order_req.currency.clone()
+        };
+
+        let order = OrderResponse {
+            order_id: order_id.clone(),
+            user_id: user_id.clone(),
+            status: "created".to_string(),
+            items: order_req.items.clone(),
+            total,
+            currency,
+            fields: None,
+            request_id: request_id.clone(),
+        };
+
+        state
+            .store
+            .insert(AppState::store_key(&user_id, &order_id), order.clone());
+        total_sum += total;
+        results.push(order);
+    }
+
+    (
+        StatusCode::CREATED,
+        Json(BulkOrderResponse {
+            user_id,
+            count: results.len(),
+            orders: results,
+            total_sum,
+            request_id,
+        }),
+    )
+        .into_response()
+}
+
+async fn list_orders(
+    Path(user_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let request_id = get_request_id_from_ext(req.extensions());
+    let prefix = format!("{}:", user_id);
+
+    let mut results = Vec::new();
+    for entry in state.store.iter() {
+        if entry.key().starts_with(&prefix) {
+            let mut order = entry.value().clone();
+            order.request_id = request_id.clone();
+            results.push(order);
+        }
+    }
+
+    Json(ListOrdersResponse {
+        user_id,
+        count: results.len(),
+        orders: results,
+        request_id,
+    })
+    .into_response()
+}
+
+async fn put_profile(
+    Path(user_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let request_id = get_request_id_from_ext(req.extensions());
+
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut profile: UserProfile = match serde_json::from_slice(&body_bytes) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    profile.user_id = user_id.clone();
+    profile.request_id = request_id;
+
+    state.profiles.insert(user_id, profile.clone());
+
+    Json(profile).into_response()
+}
+
+async fn get_profile(
+    Path(user_id): Path<String>,
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+) -> impl IntoResponse {
+    let request_id = get_request_id_from_ext(req.extensions());
+
+    match state.profiles.get(&user_id) {
+        Some(entry) => {
+            let mut profile = entry.value().clone();
+            profile.request_id = request_id;
+            Json(profile).into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "profile not found"})),
+        )
+            .into_response(),
+    }
+}
+
 // ─── Main ───
 
 #[tokio::main]
@@ -548,12 +812,20 @@ async fn main() {
     // Layers wrap in reverse order: last layer_fn added = outermost
     // We want: Recovery → RequestID → CORS → Security → BodyLimit → Logger → Handler
     let app = Router::new()
-        .route("/users/{userId}/orders", post(create_order))
+        .route("/users/{userId}/orders/bulk", post(bulk_create_orders))
+        .route(
+            "/users/{userId}/orders",
+            post(create_order).get(list_orders),
+        )
         .route(
             "/users/{userId}/orders/{orderId}",
             put(update_order)
                 .delete(delete_order)
                 .get(get_order),
+        )
+        .route(
+            "/users/{userId}/profile",
+            put(put_profile).get(get_profile),
         )
         .with_state(state)
         // Layers: bottom = closest to handler, top = outermost

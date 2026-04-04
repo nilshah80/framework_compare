@@ -1,12 +1,12 @@
 use dashmap::DashMap;
 use poem::http::{HeaderMap, HeaderValue, Method, StatusCode};
-use poem::middleware::SetHeader;
 use poem::web::{Json, Path, Query};
 use poem::{
     handler, Endpoint, EndpointExt, IntoResponse, Middleware, Request, Response,
     Result, Route, Server,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,10 +62,111 @@ struct GetOrderQuery {
     fields: Option<String>,
 }
 
+// ─── Bulk Orders types ───
+
+#[derive(Debug, Clone, Deserialize)]
+struct BulkCreateOrderReq {
+    orders: Vec<OrderRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BulkOrderResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    total_sum: f64,
+    request_id: String,
+}
+
+// ─── List Orders response ───
+
+#[derive(Debug, Clone, Serialize)]
+struct ListOrdersResponse {
+    user_id: String,
+    count: usize,
+    orders: Vec<OrderResponse>,
+    request_id: String,
+}
+
+// ─── User Profile types ───
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserProfile {
+    #[serde(default)]
+    user_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    phone: String,
+    #[serde(default)]
+    address: PoemAddress,
+    #[serde(default)]
+    preferences: PoemPreferences,
+    #[serde(default)]
+    payment_methods: Vec<PaymentMethod>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    metadata: HashMap<String, String>,
+    #[serde(default)]
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PoemAddress {
+    #[serde(default)]
+    street: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    zip: String,
+    #[serde(default)]
+    country: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PoemPreferences {
+    #[serde(default)]
+    language: String,
+    #[serde(default)]
+    currency: String,
+    #[serde(default)]
+    timezone: String,
+    #[serde(default)]
+    notifications: NotificationPrefs,
+    #[serde(default)]
+    theme: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct NotificationPrefs {
+    #[serde(default)]
+    email: bool,
+    #[serde(default)]
+    sms: bool,
+    #[serde(default)]
+    push: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PaymentMethod {
+    #[serde(rename = "type")]
+    type_: String,
+    last4: String,
+    expiry_month: i32,
+    expiry_year: i32,
+    is_default: bool,
+}
+
 // ─── Store ───
 
 struct AppState {
     store: DashMap<String, StoredOrder>,
+    profiles: DashMap<String, UserProfile>,
     next_id: AtomicU64,
 }
 
@@ -585,17 +686,180 @@ async fn get_order(
     }
 }
 
+// ─── Bulk + List + Profile Handlers ───
+
+#[handler]
+async fn bulk_create_orders(
+    Path(user_id): Path<String>,
+    req: &Request,
+    body: Json<BulkCreateOrderReq>,
+    state: poem::web::Data<&Arc<AppState>>,
+) -> Response {
+    let request_id = extract_request_id(req);
+
+    let mut results = Vec::new();
+    let mut total_sum = 0.0;
+
+    for order_req in &body.orders {
+        let id = state.next_id.fetch_add(1, Ordering::SeqCst);
+        let order_id = id.to_string();
+        let total: f64 = order_req.items.iter().map(|i| i.price * i.quantity as f64).sum();
+        let currency = if order_req.currency.is_empty() {
+            "USD".to_string()
+        } else {
+            order_req.currency.clone()
+        };
+
+        let stored = StoredOrder {
+            order_id: order_id.clone(),
+            user_id: user_id.clone(),
+            items: order_req.items.clone(),
+            total,
+            currency: currency.clone(),
+        };
+        state
+            .store
+            .insert(format!("{}:{}", user_id, order_id), stored);
+
+        results.push(OrderResponse {
+            order_id,
+            user_id: user_id.clone(),
+            status: "created".to_string(),
+            items: order_req.items.clone(),
+            total,
+            currency,
+            fields: "*".to_string(),
+            request_id: request_id.clone(),
+        });
+        total_sum += total;
+    }
+
+    let resp_body = BulkOrderResponse {
+        user_id,
+        count: results.len(),
+        orders: results,
+        total_sum,
+        request_id: request_id.clone(),
+    };
+
+    let json_str = serde_json::to_string(&resp_body).unwrap();
+    Response::builder()
+        .status(StatusCode::CREATED)
+        .header("Content-Type", "application/json")
+        .header("X-Request-ID", request_id)
+        .body(json_str)
+}
+
+#[handler]
+async fn list_orders(
+    Path(user_id): Path<String>,
+    req: &Request,
+    state: poem::web::Data<&Arc<AppState>>,
+) -> Response {
+    let request_id = extract_request_id(req);
+    let prefix = format!("{}:", user_id);
+
+    let mut results = Vec::new();
+    for entry in state.store.iter() {
+        if entry.key().starts_with(&prefix) {
+            let stored = entry.value();
+            results.push(OrderResponse {
+                order_id: stored.order_id.clone(),
+                user_id: stored.user_id.clone(),
+                status: "created".to_string(),
+                items: stored.items.clone(),
+                total: stored.total,
+                currency: stored.currency.clone(),
+                fields: "*".to_string(),
+                request_id: request_id.clone(),
+            });
+        }
+    }
+
+    let resp_body = ListOrdersResponse {
+        user_id,
+        count: results.len(),
+        orders: results,
+        request_id: request_id.clone(),
+    };
+
+    let json_str = serde_json::to_string(&resp_body).unwrap();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("X-Request-ID", request_id)
+        .body(json_str)
+}
+
+#[handler]
+async fn put_profile(
+    Path(user_id): Path<String>,
+    req: &Request,
+    body: Json<UserProfile>,
+    state: poem::web::Data<&Arc<AppState>>,
+) -> Response {
+    let request_id = extract_request_id(req);
+
+    let mut profile = body.0;
+    profile.user_id = user_id.clone();
+    profile.request_id = request_id.clone();
+
+    state.profiles.insert(user_id, profile.clone());
+
+    let json_str = serde_json::to_string(&profile).unwrap();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .header("X-Request-ID", request_id)
+        .body(json_str)
+}
+
+#[handler]
+async fn get_profile(
+    Path(user_id): Path<String>,
+    req: &Request,
+    state: poem::web::Data<&Arc<AppState>>,
+) -> Response {
+    let request_id = extract_request_id(req);
+
+    match state.profiles.get(&user_id) {
+        Some(entry) => {
+            let mut profile = entry.value().clone();
+            profile.request_id = request_id.clone();
+            let json_str = serde_json::to_string(&profile).unwrap();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/json")
+                .header("X-Request-ID", request_id)
+                .body(json_str)
+        }
+        None => {
+            let json_str = serde_json::to_string(&ErrorResponse {
+                error: "profile not found".to_string(),
+            })
+            .unwrap();
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header("Content-Type", "application/json")
+                .header("X-Request-ID", request_id)
+                .body(json_str)
+        }
+    }
+}
+
 // ─── Main ───
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), std::io::Error> {
     let state = Arc::new(AppState {
         store: DashMap::new(),
+        profiles: DashMap::new(),
         next_id: AtomicU64::new(1),
     });
 
     let app = Route::new()
-        .at("/users/:user_id/orders", poem::RouteMethod::new().post(create_order))
+        .at("/users/:user_id/orders/bulk", poem::RouteMethod::new().post(bulk_create_orders))
+        .at("/users/:user_id/orders", poem::RouteMethod::new().post(create_order).get(list_orders))
         .at(
             "/users/:user_id/orders/:order_id",
             poem::RouteMethod::new()
@@ -603,6 +867,7 @@ async fn main() -> std::result::Result<(), std::io::Error> {
                 .delete(delete_order)
                 .get(get_order),
         )
+        .at("/users/:user_id/profile", poem::RouteMethod::new().put(put_profile).get(get_profile))
         .data(state)
         .with(LoggerMiddleware)
         .with(BodyLimitMiddleware {

@@ -92,4 +92,88 @@ public class OrdersController(OrderStore store) : ControllerBase
 
         return Ok(result);
     }
+
+    [HttpPost("bulk")]
+    public IActionResult BulkCreateOrders(string userId, [FromBody] BulkCreateOrderReq req)
+    {
+        var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
+        var results = new List<OrderResponse>();
+        var totalSum = 0.0;
+
+        foreach (var item in req.Orders ?? [])
+        {
+            var total = 0.0;
+            foreach (var i in item.Items ?? [])
+                total += i.Price * i.Quantity;
+
+            var orderId = store.NextOrderId();
+            var order = new OrderResponse
+            {
+                OrderId = orderId,
+                UserId = userId,
+                Status = "created",
+                Items = item.Items ?? [],
+                Total = total,
+                Currency = string.IsNullOrEmpty(item.Currency) ? "USD" : item.Currency,
+                Fields = "",
+                RequestId = requestId
+            };
+
+            store.Set(OrderStore.Key(userId, orderId), order);
+            results.Add(order);
+            totalSum += total;
+        }
+
+        return StatusCode(201, new BulkOrderResponse
+        {
+            UserId = userId,
+            Count = results.Count,
+            Orders = results,
+            TotalSum = totalSum,
+            RequestId = requestId
+        });
+    }
+
+    [HttpGet]
+    public IActionResult ListOrders(string userId)
+    {
+        var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
+        var orders = store.GetByUser(userId);
+        foreach (var o in orders)
+            o.RequestId = requestId;
+
+        return Ok(new ListOrdersResponse
+        {
+            UserId = userId,
+            Count = orders.Count,
+            Orders = orders,
+            RequestId = requestId
+        });
+    }
+}
+
+[ApiController]
+[Route("users/{userId}/profile")]
+public class ProfileController(ProfileStore profileStore) : ControllerBase
+{
+    [HttpPut]
+    public IActionResult UpdateProfile(string userId, [FromBody] UserProfile profile)
+    {
+        var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
+        profile.UserId = userId;
+        profile.RequestId = requestId;
+        profileStore.Set(userId, profile);
+        return Ok(profile);
+    }
+
+    [HttpGet]
+    public IActionResult GetProfile(string userId)
+    {
+        var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
+        if (!profileStore.TryGet(userId, out var profile) || profile is null)
+            return NotFound(new { error = "profile not found" });
+
+        profile.RequestId = requestId;
+        return Ok(profile);
+    }
 }
