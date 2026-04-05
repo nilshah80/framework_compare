@@ -31,8 +31,30 @@ public class LoggingFilter implements Filter {
         HttpServletRequest req = (HttpServletRequest) request;
         ContentCachingResponseWrapper res = new ContentCachingResponseWrapper((HttpServletResponse) response);
 
+        // Capture request body
+        byte[] requestBodyBytes = req.getInputStream().readAllBytes();
+        String requestBody = new String(requestBodyBytes, StandardCharsets.UTF_8);
+
+        // Wrap request so downstream can still read the body
+        jakarta.servlet.http.HttpServletRequestWrapper wrappedReq = new jakarta.servlet.http.HttpServletRequestWrapper(req) {
+            @Override
+            public jakarta.servlet.ServletInputStream getInputStream() {
+                return new jakarta.servlet.ServletInputStream() {
+                    private final java.io.ByteArrayInputStream bais = new java.io.ByteArrayInputStream(requestBodyBytes);
+                    @Override public int read() { return bais.read(); }
+                    @Override public boolean isFinished() { return bais.available() == 0; }
+                    @Override public boolean isReady() { return true; }
+                    @Override public void setReadListener(jakarta.servlet.ReadListener l) {}
+                };
+            }
+            @Override
+            public java.io.BufferedReader getReader() {
+                return new java.io.BufferedReader(new java.io.InputStreamReader(getInputStream(), StandardCharsets.UTF_8));
+            }
+        };
+
         long start = System.nanoTime();
-        chain.doFilter(request, res);
+        chain.doFilter(wrappedReq, res);
         long latencyNs = System.nanoTime() - start;
 
         double latencyMs = latencyNs / 1_000_000.0;
@@ -70,6 +92,14 @@ public class LoggingFilter implements Filter {
             }
         }
 
+        // Client IP from X-Forwarded-For or fallback to remote addr
+        String clientIp = req.getHeader("X-Forwarded-For");
+        if (clientIp != null && !clientIp.isBlank()) {
+            clientIp = clientIp.split(",")[0].trim();
+        } else {
+            clientIp = req.getRemoteAddr();
+        }
+
         Map<String, Object> logEntry = new LinkedHashMap<>();
         logEntry.put("level", "INFO");
         logEntry.put("message", "http_dump");
@@ -77,9 +107,10 @@ public class LoggingFilter implements Filter {
         logEntry.put("method", req.getMethod());
         logEntry.put("path", req.getRequestURI());
         logEntry.put("query", queryParams);
-        logEntry.put("client_ip", req.getRemoteAddr());
+        logEntry.put("client_ip", clientIp);
         logEntry.put("user_agent", req.getHeader("User-Agent") != null ? req.getHeader("User-Agent") : "");
         logEntry.put("request_headers", reqHeaders);
+        logEntry.put("request_body", requestBody);
         logEntry.put("status", res.getStatus());
         logEntry.put("latency", formatLatency(latencyNs));
         logEntry.put("latency_ms", latencyMs);

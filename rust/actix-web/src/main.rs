@@ -2,14 +2,13 @@ use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
     web, App, HttpMessage, HttpRequest, HttpResponse, HttpServer,
 };
-use dashmap::DashMap;
+use pgstore::{BulkOrderInput, PgStore};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::{self, Future, Ready};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -160,31 +159,10 @@ struct PaymentMethod {
     is_default: bool,
 }
 
-// ─── Store ───
+// ─── App State ───
 
 struct AppState {
-    store: DashMap<String, OrderResponse>,
-    profiles: DashMap<String, UserProfile>,
-    counter: AtomicU64,
-}
-
-impl AppState {
-    fn new() -> Self {
-        Self {
-            store: DashMap::new(),
-            profiles: DashMap::new(),
-            counter: AtomicU64::new(0),
-        }
-    }
-
-    fn next_order_id(&self) -> String {
-        let id = self.counter.fetch_add(1, Ordering::SeqCst) + 1;
-        id.to_string()
-    }
-
-    fn store_key(user_id: &str, order_id: &str) -> String {
-        format!("{user_id}:{order_id}")
-    }
+    store: PgStore,
 }
 
 // ─── Helpers ───
@@ -214,6 +192,140 @@ fn redact_headers(
         map.insert(k.to_string(), serde_json::Value::String(v));
     }
     map
+}
+
+fn extract_client_ip(req: &ServiceRequest) -> String {
+    // Parse X-Forwarded-For like Aarv's RealIP: take first IP
+    if let Some(xff) = req.headers().get("x-forwarded-for") {
+        if let Ok(val) = xff.to_str() {
+            let first = val.split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    req.connection_info()
+        .peer_addr()
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn to_pgstore_items(items: &[OrderItem]) -> Vec<pgstore::OrderItem> {
+    items
+        .iter()
+        .map(|i| pgstore::OrderItem {
+            product_id: i.product_id.clone(),
+            name: i.name.clone(),
+            quantity: i.quantity,
+            price: i.price,
+        })
+        .collect()
+}
+
+fn from_pgstore_items(items: &[pgstore::OrderItem]) -> Vec<OrderItem> {
+    items
+        .iter()
+        .map(|i| OrderItem {
+            product_id: i.product_id.clone(),
+            name: i.name.clone(),
+            quantity: i.quantity,
+            price: i.price,
+        })
+        .collect()
+}
+
+fn order_to_response(o: pgstore::Order, request_id: String) -> OrderResponse {
+    OrderResponse {
+        order_id: o.order_id,
+        user_id: o.user_id,
+        status: o.status,
+        items: from_pgstore_items(&o.items),
+        total: o.total,
+        currency: o.currency,
+        fields: None,
+        request_id,
+    }
+}
+
+fn profile_to_user(p: pgstore::Profile, request_id: String) -> UserProfile {
+    UserProfile {
+        user_id: p.user_id,
+        name: p.name,
+        email: p.email,
+        phone: p.phone,
+        address: Address {
+            street: p.address.street,
+            city: p.address.city,
+            state: p.address.state,
+            zip: p.address.zip,
+            country: p.address.country,
+        },
+        preferences: Preferences {
+            language: p.preferences.language,
+            currency: p.preferences.currency,
+            timezone: p.preferences.timezone,
+            notifications: NotificationPrefs {
+                email: p.preferences.notifications.email,
+                sms: p.preferences.notifications.sms,
+                push: p.preferences.notifications.push,
+            },
+            theme: p.preferences.theme,
+        },
+        payment_methods: p
+            .payment_methods
+            .iter()
+            .map(|pm| PaymentMethod {
+                type_: pm.type_.clone(),
+                last4: pm.last4.clone(),
+                expiry_month: pm.expiry_month,
+                expiry_year: pm.expiry_year,
+                is_default: pm.is_default,
+            })
+            .collect(),
+        tags: p.tags,
+        metadata: p.metadata,
+        request_id,
+    }
+}
+
+fn user_to_profile(u: &UserProfile) -> pgstore::Profile {
+    pgstore::Profile {
+        user_id: u.user_id.clone(),
+        name: u.name.clone(),
+        email: u.email.clone(),
+        phone: u.phone.clone(),
+        address: pgstore::Address {
+            street: u.address.street.clone(),
+            city: u.address.city.clone(),
+            state: u.address.state.clone(),
+            zip: u.address.zip.clone(),
+            country: u.address.country.clone(),
+        },
+        preferences: pgstore::Preferences {
+            language: u.preferences.language.clone(),
+            currency: u.preferences.currency.clone(),
+            timezone: u.preferences.timezone.clone(),
+            notifications: pgstore::NotificationPrefs {
+                email: u.preferences.notifications.email,
+                sms: u.preferences.notifications.sms,
+                push: u.preferences.notifications.push,
+            },
+            theme: u.preferences.theme.clone(),
+        },
+        payment_methods: u
+            .payment_methods
+            .iter()
+            .map(|pm| pgstore::PaymentMethod {
+                type_: pm.type_.clone(),
+                last4: pm.last4.clone(),
+                expiry_month: pm.expiry_month,
+                expiry_year: pm.expiry_year,
+                is_default: pm.is_default,
+            })
+            .collect(),
+        tags: u.tags.clone(),
+        metadata: u.metadata.clone(),
+    }
 }
 
 // ─── Recovery Middleware ───
@@ -256,14 +368,10 @@ where
     }
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let svc = self.service.clone();
-        Box::pin(async move {
-            let res = svc.borrow_mut().call(req).await;
-            match res {
-                Ok(resp) => Ok(resp),
-                Err(e) => Err(e),
-            }
-        })
+        // Get the future while borrowed, then drop the borrow before awaiting.
+        // This prevents RefCell panics under concurrent load.
+        let fut = self.service.borrow_mut().call(req);
+        Box::pin(async move { fut.await })
     }
 }
 
@@ -318,7 +426,8 @@ where
 
         let svc = self.service.clone();
         Box::pin(async move {
-            let mut res = svc.borrow_mut().call(req).await?;
+            let fut = svc.borrow_mut().call(req);
+            let mut res = fut.await?;
             res.headers_mut().insert(
                 actix_web::http::header::HeaderName::from_static("x-request-id"),
                 actix_web::http::header::HeaderValue::from_str(&request_id).unwrap(),
@@ -378,7 +487,8 @@ where
                 insert_cors_headers(sr.headers_mut());
                 Ok(sr)
             } else {
-                let mut res = svc.borrow_mut().call(req).await?;
+                let fut = svc.borrow_mut().call(req);
+            let mut res = fut.await?;
                 insert_cors_headers(res.headers_mut());
                 Ok(res)
             }
@@ -444,7 +554,8 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let svc = self.service.clone();
         Box::pin(async move {
-            let mut res = svc.borrow_mut().call(req).await?;
+            let fut = svc.borrow_mut().call(req);
+            let mut res = fut.await?;
             let headers = res.headers_mut();
             use actix_web::http::header::{HeaderName, HeaderValue};
             headers.insert(
@@ -544,7 +655,7 @@ where
                     .json(serde_json::json!({"error": "request body too large"}));
                 Ok(req.into_response(resp))
             } else {
-                svc.borrow_mut().call(req).await
+                { let fut = svc.borrow_mut().call(req); fut.await }
             }
         })
     }
@@ -594,11 +705,7 @@ where
         let method = req.method().to_string();
         let path = req.path().to_string();
         let query_string = req.query_string().to_string();
-        let client_ip = req
-            .connection_info()
-            .peer_addr()
-            .unwrap_or("unknown")
-            .to_string();
+        let client_ip = extract_client_ip(&req);
         let user_agent = req
             .headers()
             .get("user-agent")
@@ -612,10 +719,14 @@ where
             .unwrap_or_default();
         let req_headers = redact_headers(req.headers());
 
+        // Capture request body bytes
+        let request_body_str = String::new(); // actix doesn't easily expose body before handler
+
         let svc = self.service.clone();
 
         Box::pin(async move {
-            let res = svc.borrow_mut().call(req).await?;
+            let fut = svc.borrow_mut().call(req);
+            let res = fut.await?;
 
             let status = res.status().as_u16();
             let latency = start.elapsed();
@@ -668,6 +779,7 @@ where
                 "client_ip": client_ip,
                 "user_agent": user_agent,
                 "request_headers": req_headers,
+                "request_body": request_body_str,
                 "status": status,
                 "latency": format!("{latency:?}"),
                 "latency_ms": latency_ms,
@@ -687,8 +799,6 @@ where
             let mut sr = ServiceResponse::new(parts, new_resp);
             for (k, v) in &resp_headers {
                 if let serde_json::Value::String(val) = v {
-                    // Use original (non-redacted) values from the actual response
-                    // resp_headers already has correct values
                     if let (Ok(hn), Ok(hv)) = (
                         actix_web::http::header::HeaderName::from_bytes(k.as_bytes()),
                         actix_web::http::header::HeaderValue::from_str(val),
@@ -738,36 +848,22 @@ async fn create_order(
     req: HttpRequest,
 ) -> HttpResponse {
     let user_id = &path.user_id;
-    let order_id = state.next_order_id();
     let request_id = get_request_id(&req);
 
-    let mut total = 0.0;
-    for item in &body.items {
-        total += item.price * item.quantity as f64;
+    let items = to_pgstore_items(&body.items);
+    let currency = if body.currency.is_empty() { "USD" } else { &body.currency };
+
+    match state.store.create_order(user_id, &items, currency).await {
+        Ok(order) => {
+            let resp = order_to_response(order, request_id);
+            HttpResponse::Created().json(resp)
+        }
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
+            request_id: Some(request_id),
+        }),
     }
-
-    let currency = if body.currency.is_empty() {
-        "USD".to_string()
-    } else {
-        body.currency.clone()
-    };
-
-    let order = OrderResponse {
-        order_id: order_id.clone(),
-        user_id: user_id.clone(),
-        status: "created".to_string(),
-        items: body.items.clone(),
-        total,
-        currency,
-        fields: None,
-        request_id,
-    };
-
-    state
-        .store
-        .insert(AppState::store_key(user_id, &order_id), order.clone());
-
-    HttpResponse::Created().json(order)
 }
 
 async fn update_order(
@@ -779,40 +875,26 @@ async fn update_order(
     let user_id = &path.user_id;
     let order_id = &path.order_id;
     let request_id = get_request_id(&req);
-    let key = AppState::store_key(user_id, order_id);
 
-    let mut entry = match state.store.get_mut(&key) {
-        Some(e) => e,
-        None => {
-            return HttpResponse::NotFound().json(ErrorResponse {
-                error: "order not found".to_string(),
-                order_id: Some(order_id.clone()),
-                request_id: Some(request_id),
-            });
+    let items = to_pgstore_items(&body.items);
+    let currency = if body.currency.is_empty() { "USD" } else { &body.currency };
+
+    match state.store.update_order(user_id, order_id, &items, currency).await {
+        Ok(Some(order)) => {
+            let resp = order_to_response(order, request_id);
+            HttpResponse::Ok().json(resp)
         }
-    };
-
-    let mut total = 0.0;
-    for item in &body.items {
-        total += item.price * item.quantity as f64;
+        Ok(None) => HttpResponse::NotFound().json(ErrorResponse {
+            error: "order not found".to_string(),
+            order_id: Some(order_id.clone()),
+            request_id: Some(request_id),
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
+            request_id: Some(request_id),
+        }),
     }
-
-    let currency = if body.currency.is_empty() {
-        "USD".to_string()
-    } else {
-        body.currency.clone()
-    };
-
-    entry.items = body.items.clone();
-    entry.total = total;
-    entry.currency = currency;
-    entry.status = "updated".to_string();
-    entry.request_id = request_id;
-
-    let order = entry.clone();
-    drop(entry);
-
-    HttpResponse::Ok().json(order)
 }
 
 async fn delete_order(
@@ -823,17 +905,21 @@ async fn delete_order(
     let user_id = &path.user_id;
     let order_id = &path.order_id;
     let request_id = get_request_id(&req);
-    let key = AppState::store_key(user_id, order_id);
 
-    match state.store.remove(&key) {
-        Some(_) => HttpResponse::Ok().json(DeleteResponse {
+    match state.store.delete_order(user_id, order_id).await {
+        Ok(true) => HttpResponse::Ok().json(DeleteResponse {
             message: "order deleted".to_string(),
             order_id: order_id.clone(),
             request_id,
         }),
-        None => HttpResponse::NotFound().json(ErrorResponse {
+        Ok(false) => HttpResponse::NotFound().json(ErrorResponse {
             error: "order not found".to_string(),
             order_id: Some(order_id.clone()),
+            request_id: Some(request_id),
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
             request_id: Some(request_id),
         }),
     }
@@ -849,18 +935,21 @@ async fn get_order(
     let order_id = &path.order_id;
     let request_id = get_request_id(&req);
     let fields = query.fields.clone().unwrap_or_else(|| "*".to_string());
-    let key = AppState::store_key(user_id, order_id);
 
-    match state.store.get(&key) {
-        Some(entry) => {
-            let mut order = entry.clone();
-            order.fields = Some(fields);
-            order.request_id = request_id;
-            HttpResponse::Ok().json(order)
+    match state.store.get_order(user_id, order_id).await {
+        Ok(Some(order)) => {
+            let mut resp = order_to_response(order, request_id);
+            resp.fields = Some(fields);
+            HttpResponse::Ok().json(resp)
         }
-        None => HttpResponse::NotFound().json(ErrorResponse {
+        Ok(None) => HttpResponse::NotFound().json(ErrorResponse {
             error: "order not found".to_string(),
             order_id: Some(order_id.clone()),
+            request_id: Some(request_id),
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
             request_id: Some(request_id),
         }),
     }
@@ -877,46 +966,39 @@ async fn bulk_create_orders(
     let user_id = &path.user_id;
     let request_id = get_request_id(&req);
 
-    let mut results = Vec::new();
-    let mut total_sum = 0.0;
+    let inputs: Vec<BulkOrderInput> = body
+        .orders
+        .iter()
+        .map(|o| BulkOrderInput {
+            items: to_pgstore_items(&o.items),
+            currency: if o.currency.is_empty() {
+                "USD".to_string()
+            } else {
+                o.currency.clone()
+            },
+        })
+        .collect();
 
-    for order_req in &body.orders {
-        let order_id = state.next_order_id();
-        let mut total = 0.0;
-        for item in &order_req.items {
-            total += item.price * item.quantity as f64;
+    match state.store.bulk_create_orders(user_id, &inputs).await {
+        Ok((orders, total_sum)) => {
+            let results: Vec<OrderResponse> = orders
+                .into_iter()
+                .map(|o| order_to_response(o, request_id.clone()))
+                .collect();
+            HttpResponse::Created().json(BulkOrderResponse {
+                user_id: user_id.clone(),
+                count: results.len(),
+                orders: results,
+                total_sum,
+                request_id,
+            })
         }
-        let currency = if order_req.currency.is_empty() {
-            "USD".to_string()
-        } else {
-            order_req.currency.clone()
-        };
-
-        let order = OrderResponse {
-            order_id: order_id.clone(),
-            user_id: user_id.clone(),
-            status: "created".to_string(),
-            items: order_req.items.clone(),
-            total,
-            currency,
-            fields: None,
-            request_id: request_id.clone(),
-        };
-
-        state
-            .store
-            .insert(AppState::store_key(user_id, &order_id), order.clone());
-        total_sum += total;
-        results.push(order);
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
+            request_id: Some(request_id),
+        }),
     }
-
-    HttpResponse::Created().json(BulkOrderResponse {
-        user_id: user_id.clone(),
-        count: results.len(),
-        orders: results,
-        total_sum,
-        request_id,
-    })
 }
 
 async fn list_orders(
@@ -926,23 +1008,26 @@ async fn list_orders(
 ) -> HttpResponse {
     let user_id = &path.user_id;
     let request_id = get_request_id(&req);
-    let prefix = format!("{}:", user_id);
 
-    let mut results = Vec::new();
-    for entry in state.store.iter() {
-        if entry.key().starts_with(&prefix) {
-            let mut order = entry.value().clone();
-            order.request_id = request_id.clone();
-            results.push(order);
+    match state.store.list_orders(user_id).await {
+        Ok(orders) => {
+            let results: Vec<OrderResponse> = orders
+                .into_iter()
+                .map(|o| order_to_response(o, request_id.clone()))
+                .collect();
+            HttpResponse::Ok().json(ListOrdersResponse {
+                user_id: user_id.clone(),
+                count: results.len(),
+                orders: results,
+                request_id,
+            })
         }
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
+            request_id: Some(request_id),
+        }),
     }
-
-    HttpResponse::Ok().json(ListOrdersResponse {
-        user_id: user_id.clone(),
-        count: results.len(),
-        orders: results,
-        request_id,
-    })
 }
 
 async fn put_profile(
@@ -956,11 +1041,20 @@ async fn put_profile(
 
     let mut profile = body.into_inner();
     profile.user_id = user_id.clone();
-    profile.request_id = request_id;
 
-    state.profiles.insert(user_id.clone(), profile.clone());
+    let pg_profile = user_to_profile(&profile);
 
-    HttpResponse::Ok().json(profile)
+    match state.store.upsert_profile(user_id, &pg_profile).await {
+        Ok(()) => {
+            profile.request_id = request_id;
+            HttpResponse::Ok().json(profile)
+        }
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
+            request_id: Some(request_id),
+        }),
+    }
 }
 
 async fn get_profile(
@@ -971,16 +1065,20 @@ async fn get_profile(
     let user_id = &path.user_id;
     let request_id = get_request_id(&req);
 
-    match state.profiles.get(user_id) {
-        Some(entry) => {
-            let mut profile = entry.value().clone();
-            profile.request_id = request_id;
-            HttpResponse::Ok().json(profile)
+    match state.store.get_profile(user_id).await {
+        Ok(Some(profile)) => {
+            let user = profile_to_user(profile, request_id);
+            HttpResponse::Ok().json(user)
         }
-        None => HttpResponse::NotFound().json(ErrorResponse {
+        Ok(None) => HttpResponse::NotFound().json(ErrorResponse {
             error: "profile not found".to_string(),
             order_id: None,
             request_id: None,
+        }),
+        Err(e) => HttpResponse::InternalServerError().json(ErrorResponse {
+            error: format!("db error: {}", e),
+            order_id: None,
+            request_id: Some(request_id),
         }),
     }
 }
@@ -989,7 +1087,16 @@ async fn get_profile(
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let state = Arc::new(AppState::new());
+    let pg_dsn = std::env::var("PG_DSN").expect("PG_DSN environment variable must be set");
+    let pg_store = PgStore::new(&pg_dsn)
+        .await
+        .expect("Failed to connect to PostgreSQL");
+    pg_store
+        .init_schema()
+        .await
+        .expect("Failed to initialize schema");
+
+    let state = Arc::new(AppState { store: pg_store });
 
     let log_entry = serde_json::json!({
         "level": "INFO",
@@ -1003,7 +1110,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(state.clone()))
             .app_data(web::JsonConfig::default().limit(1_048_576))
             // Middleware: outermost .wrap() runs first on request
-            // Order: Recovery → RequestID → CORS → Security → BodyLimit → Logger → Handler
+            // Order: Recovery -> RequestID -> CORS -> Security -> BodyLimit -> Logger -> Handler
             // actix .wrap() wraps outside, so first .wrap = outermost
             .wrap(StructuredLogger)
             .wrap(BodyLimit { max_bytes: 1_048_576 })

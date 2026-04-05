@@ -1,6 +1,8 @@
 package benchmark;
 
 import benchmark.model.*;
+import benchmark.pgstore.*;
+import benchmark.pgstore.Order;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
@@ -10,17 +12,25 @@ import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class Application {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final OrderStore STORE = OrderStore.getInstance();
+    private static PgStore pgStore;
     private static final Set<String> PII_HEADERS = Set.of(
         "authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token"
     );
     private static final long MAX_BODY_SIZE = 1_048_576;
 
     public static void main(String[] args) {
+        String dsn = System.getenv("PG_DSN");
+        if (dsn == null || dsn.isBlank()) {
+            dsn = "postgres://postgres:postgres@localhost:5432/benchmark?sslmode=disable";
+        }
+        pgStore = new PgStore(dsn);
+        pgStore.initSchema();
+
         Javalin app = Javalin.create(config -> {
             config.showJavalinBanner = false;
             config.useVirtualThreads = true;
@@ -68,6 +78,9 @@ public class Application {
             ctx.header("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
             ctx.header("Cross-Origin-Opener-Policy", "same-origin");
 
+            // Capture request body
+            ctx.attribute("requestBody", ctx.body());
+
             // Body Limit
             String contentLengthStr = ctx.header("Content-Length");
             if (contentLengthStr != null) {
@@ -93,27 +106,48 @@ public class Application {
             String requestId = ctx.attribute("requestId");
             BulkOrderRequest req = ctx.bodyAsClass(BulkOrderRequest.class);
 
+            List<BulkOrderInput> inputs = req.getOrders().stream()
+                .map(orderReq -> new BulkOrderInput(
+                    orderReq.getItems().stream()
+                        .map(i -> new OrderItem(i.getProductId(), i.getName(), i.getQuantity(), i.getPrice()))
+                        .collect(Collectors.toList()),
+                    orderReq.getCurrency()))
+                .collect(Collectors.toList());
+
+            BulkResult bulkResult = pgStore.bulkCreateOrders(userId, inputs);
+
             List<OrderResponse> results = new ArrayList<>();
-            double totalSum = 0;
-
-            for (OrderRequest orderReq : req.getOrders()) {
-                String currency = (orderReq.getCurrency() == null || orderReq.getCurrency().isBlank()) ? "USD" : orderReq.getCurrency();
-                double total = orderReq.getItems().stream().mapToDouble(i -> i.getQuantity() * i.getPrice()).sum();
-                String orderId = String.valueOf(STORE.nextId());
-
-                OrderResponse order = new OrderResponse(orderId, userId, "created", orderReq.getItems(), total, currency, null, requestId);
-                STORE.put(userId, orderId, order);
-                results.add(order);
-                totalSum += total;
+            for (int i = 0; i < bulkResult.orders().size(); i++) {
+                Order o = bulkResult.orders().get(i);
+                OrderResponse resp = new OrderResponse(o.orderId(), o.userId(), o.status(),
+                    req.getOrders().get(i).getItems(), o.total(), o.currency(), null, requestId);
+                results.add(resp);
             }
 
-            sendJson(ctx, 201, new BulkOrderResponse(userId, results.size(), results, totalSum, requestId));
+            sendJson(ctx, 201, new BulkOrderResponse(userId, results.size(), results, bulkResult.totalSum(), requestId));
         });
 
         app.get("/users/{userId}/orders", ctx -> {
             String userId = ctx.pathParam("userId");
             String requestId = ctx.attribute("requestId");
-            List<OrderResponse> orders = STORE.listByUser(userId);
+            List<Order> pgOrders = pgStore.listOrders(userId);
+
+            List<OrderResponse> orders = pgOrders.stream()
+                .map(o -> {
+                    List<OrderRequest.Item> responseItems = o.items().stream()
+                        .map(i -> {
+                            OrderRequest.Item item = new OrderRequest.Item();
+                            item.setProductId(i.productId());
+                            item.setName(i.name());
+                            item.setQuantity(i.quantity());
+                            item.setPrice(i.price());
+                            return item;
+                        })
+                        .collect(Collectors.toList());
+                    return new OrderResponse(o.orderId(), o.userId(), o.status(),
+                        responseItems, o.total(), o.currency(), null, requestId);
+                })
+                .collect(Collectors.toList());
 
             sendJson(ctx, 200, Map.of(
                 "user_id", userId,
@@ -128,24 +162,26 @@ public class Application {
             String requestId = ctx.attribute("requestId");
             UserProfile body = ctx.bodyAsClass(UserProfile.class);
 
+            benchmark.pgstore.Profile pgProfile = toStoreProfile(body);
+            pgStore.upsertProfile(userId, pgProfile);
+
             body.setUserId(userId);
             body.setRequestId(requestId);
-            STORE.putProfile(userId, body);
-
             sendJson(ctx, 200, body);
         });
 
         app.get("/users/{userId}/profile", ctx -> {
             String userId = ctx.pathParam("userId");
             String requestId = ctx.attribute("requestId");
-            UserProfile profile = STORE.getProfile(userId);
 
-            if (profile == null) {
+            Optional<benchmark.pgstore.Profile> result = pgStore.getProfile(userId);
+            if (result.isEmpty()) {
                 sendJson(ctx, 404, new ErrorResponse("profile not found"));
                 return;
             }
 
-            profile.setRequestId(requestId);
+            benchmark.pgstore.Profile p = result.get();
+            UserProfile profile = fromStoreProfile(p, requestId);
             sendJson(ctx, 200, profile);
         });
 
@@ -154,14 +190,15 @@ public class Application {
             String requestId = ctx.attribute("requestId");
             OrderRequest req = ctx.bodyAsClass(OrderRequest.class);
 
-            String currency = (req.getCurrency() == null || req.getCurrency().isBlank()) ? "USD" : req.getCurrency();
-            double total = req.getItems().stream().mapToDouble(i -> i.getQuantity() * i.getPrice()).sum();
-            String orderId = String.valueOf(STORE.nextId());
+            List<OrderItem> items = req.getItems().stream()
+                .map(i -> new OrderItem(i.getProductId(), i.getName(), i.getQuantity(), i.getPrice()))
+                .collect(Collectors.toList());
 
-            OrderResponse order = new OrderResponse(orderId, userId, "created", req.getItems(), total, currency, "*", requestId);
-            STORE.put(userId, orderId, order);
+            Order order = pgStore.createOrder(userId, items, req.getCurrency());
 
-            sendJson(ctx, 201, order);
+            OrderResponse resp = new OrderResponse(order.orderId(), order.userId(), order.status(),
+                req.getItems(), order.total(), order.currency(), "*", requestId);
+            sendJson(ctx, 201, resp);
         });
 
         app.put("/users/{userId}/orders/{orderId}", ctx -> {
@@ -169,20 +206,21 @@ public class Application {
             String orderId = ctx.pathParam("orderId");
             String requestId = ctx.attribute("requestId");
 
-            OrderResponse existing = STORE.get(userId, orderId);
-            if (existing == null) {
+            OrderRequest req = ctx.bodyAsClass(OrderRequest.class);
+            List<OrderItem> items = req.getItems().stream()
+                .map(i -> new OrderItem(i.getProductId(), i.getName(), i.getQuantity(), i.getPrice()))
+                .collect(Collectors.toList());
+
+            Optional<Order> updated = pgStore.updateOrder(userId, orderId, items, req.getCurrency());
+            if (updated.isEmpty()) {
                 sendJson(ctx, 404, new ErrorResponse("order not found"));
                 return;
             }
 
-            OrderRequest req = ctx.bodyAsClass(OrderRequest.class);
-            String currency = (req.getCurrency() == null || req.getCurrency().isBlank()) ? "USD" : req.getCurrency();
-            double total = req.getItems().stream().mapToDouble(i -> i.getQuantity() * i.getPrice()).sum();
-
-            OrderResponse updated = new OrderResponse(orderId, userId, "updated", req.getItems(), total, currency, "*", requestId);
-            STORE.put(userId, orderId, updated);
-
-            sendJson(ctx, 200, updated);
+            Order o = updated.get();
+            OrderResponse resp = new OrderResponse(o.orderId(), o.userId(), o.status(),
+                req.getItems(), o.total(), o.currency(), "*", requestId);
+            sendJson(ctx, 200, resp);
         });
 
         app.delete("/users/{userId}/orders/{orderId}", ctx -> {
@@ -190,8 +228,8 @@ public class Application {
             String orderId = ctx.pathParam("orderId");
             String requestId = ctx.attribute("requestId");
 
-            OrderResponse existing = STORE.remove(userId, orderId);
-            if (existing == null) {
+            boolean deleted = pgStore.deleteOrder(userId, orderId);
+            if (!deleted) {
                 sendJson(ctx, 404, new ErrorResponse("order not found"));
                 return;
             }
@@ -208,19 +246,31 @@ public class Application {
                 fields = "*";
             }
 
-            OrderResponse existing = STORE.get(userId, orderId);
-            if (existing == null) {
+            Optional<Order> result = pgStore.getOrder(userId, orderId);
+            if (result.isEmpty()) {
                 sendJson(ctx, 404, new ErrorResponse("order not found"));
                 return;
             }
 
-            OrderResponse withFields = new OrderResponse(
-                existing.getOrderId(), existing.getUserId(), existing.getStatus(),
-                existing.getItems(), existing.getTotal(), existing.getCurrency(),
+            Order o = result.get();
+            List<OrderRequest.Item> responseItems = o.items().stream()
+                .map(i -> {
+                    OrderRequest.Item item = new OrderRequest.Item();
+                    item.setProductId(i.productId());
+                    item.setName(i.name());
+                    item.setQuantity(i.quantity());
+                    item.setPrice(i.price());
+                    return item;
+                })
+                .collect(Collectors.toList());
+
+            OrderResponse resp = new OrderResponse(
+                o.orderId(), o.userId(), o.status(),
+                responseItems, o.total(), o.currency(),
                 fields, requestId
             );
 
-            sendJson(ctx, 200, withFields);
+            sendJson(ctx, 200, resp);
         });
 
         app.start(8107);
@@ -280,6 +330,18 @@ public class Application {
             if (responseBody == null) responseBody = "";
             int bytesOut = responseBody.getBytes(StandardCharsets.UTF_8).length;
 
+            // Client IP from X-Forwarded-For
+            String clientIp = ctx.header("X-Forwarded-For");
+            if (clientIp != null && !clientIp.isBlank()) {
+                clientIp = clientIp.split(",")[0].trim();
+            } else {
+                clientIp = ctx.ip();
+            }
+
+            // Request body
+            String requestBody = ctx.attribute("requestBody");
+            if (requestBody == null) requestBody = "";
+
             Map<String, Object> logEntry = new LinkedHashMap<>();
             logEntry.put("level", "INFO");
             logEntry.put("message", "http_dump");
@@ -287,9 +349,10 @@ public class Application {
             logEntry.put("method", ctx.method().name());
             logEntry.put("path", ctx.path());
             logEntry.put("query", queryParams);
-            logEntry.put("client_ip", ctx.ip());
+            logEntry.put("client_ip", clientIp);
             logEntry.put("user_agent", ctx.header("User-Agent") != null ? ctx.header("User-Agent") : "");
             logEntry.put("request_headers", reqHeaders);
+            logEntry.put("request_body", requestBody);
             logEntry.put("status", ctx.res().getStatus());
             logEntry.put("latency", formatLatency(latencyNs));
             logEntry.put("latency_ms", latencyMs);
@@ -306,5 +369,83 @@ public class Application {
             return (nanos / 1000.0) + "us";
         }
         return (nanos / 1_000_000.0) + "ms";
+    }
+
+    private static benchmark.pgstore.Profile toStoreProfile(UserProfile body) {
+        benchmark.pgstore.Address addr = null;
+        if (body.getAddress() != null) {
+            benchmark.model.Address a = body.getAddress();
+            addr = new benchmark.pgstore.Address(a.getStreet(), a.getCity(),
+                a.getState(), a.getZip(), a.getCountry());
+        }
+        benchmark.pgstore.Preferences prefs = null;
+        if (body.getPreferences() != null) {
+            benchmark.model.Preferences pr = body.getPreferences();
+            benchmark.pgstore.NotificationPrefs np = null;
+            if (pr.getNotifications() != null) {
+                benchmark.model.NotificationPrefs n = pr.getNotifications();
+                np = new benchmark.pgstore.NotificationPrefs(n.isEmail(), n.isSms(), n.isPush());
+            }
+            prefs = new benchmark.pgstore.Preferences(pr.getLanguage(),
+                pr.getCurrency(), pr.getTimezone(), np, pr.getTheme());
+        }
+        List<benchmark.pgstore.PaymentMethod> pms = null;
+        if (body.getPaymentMethods() != null) {
+            pms = body.getPaymentMethods().stream()
+                .map(pm -> new benchmark.pgstore.PaymentMethod(pm.getType(), pm.getLast4(),
+                    pm.getExpiryMonth(), pm.getExpiryYear(), pm.isIsDefault()))
+                .collect(Collectors.toList());
+        }
+        return new benchmark.pgstore.Profile(body.getUserId(), body.getName(), body.getEmail(), body.getPhone(),
+            addr, prefs, pms, body.getTags(), body.getMetadata());
+    }
+
+    private static UserProfile fromStoreProfile(benchmark.pgstore.Profile p, String requestId) {
+        UserProfile profile = new UserProfile();
+        profile.setUserId(p.userId());
+        profile.setName(p.name());
+        profile.setEmail(p.email());
+        profile.setPhone(p.phone());
+        if (p.address() != null) {
+            benchmark.model.Address a = new benchmark.model.Address();
+            a.setStreet(p.address().street());
+            a.setCity(p.address().city());
+            a.setState(p.address().state());
+            a.setZip(p.address().zip());
+            a.setCountry(p.address().country());
+            profile.setAddress(a);
+        }
+        if (p.preferences() != null) {
+            benchmark.model.Preferences pr = new benchmark.model.Preferences();
+            pr.setLanguage(p.preferences().language());
+            pr.setCurrency(p.preferences().currency());
+            pr.setTimezone(p.preferences().timezone());
+            pr.setTheme(p.preferences().theme());
+            if (p.preferences().notifications() != null) {
+                benchmark.model.NotificationPrefs np = new benchmark.model.NotificationPrefs();
+                np.setEmail(p.preferences().notifications().email());
+                np.setSms(p.preferences().notifications().sms());
+                np.setPush(p.preferences().notifications().push());
+                pr.setNotifications(np);
+            }
+            profile.setPreferences(pr);
+        }
+        if (p.paymentMethods() != null) {
+            profile.setPaymentMethods(p.paymentMethods().stream()
+                .map(pm -> {
+                    benchmark.model.PaymentMethod m = new benchmark.model.PaymentMethod();
+                    m.setType(pm.type());
+                    m.setLast4(pm.last4());
+                    m.setExpiryMonth(pm.expiryMonth());
+                    m.setExpiryYear(pm.expiryYear());
+                    m.setIsDefault(pm.isDefault());
+                    return m;
+                })
+                .collect(Collectors.toList()));
+        }
+        profile.setTags(p.tags());
+        profile.setMetadata(p.metadata());
+        profile.setRequestId(requestId);
+        return profile;
     }
 }

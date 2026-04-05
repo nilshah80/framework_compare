@@ -66,9 +66,17 @@ public class LoggingFilter implements ContainerRequestFilter, ContainerResponseF
         logEntry.put("method", requestContext.getMethod());
         logEntry.put("path", requestContext.getUriInfo().getPath());
         logEntry.put("query", queryParams);
-        logEntry.put("client_ip", "");
+        // Client IP from X-Forwarded-For
+        String clientIp = requestContext.getHeaderString("X-Forwarded-For");
+        if (clientIp != null && !clientIp.isBlank()) {
+            clientIp = clientIp.split(",")[0].trim();
+        } else {
+            clientIp = "";
+        }
+        logEntry.put("client_ip", clientIp);
         logEntry.put("user_agent", requestContext.getHeaderString("User-Agent"));
         logEntry.put("request_headers", reqHeaders);
+        logEntry.put("request_body", "");
         logEntry.put("status", responseContext.getStatus());
         logEntry.put("latency", formatLatency(elapsed));
         logEntry.put("latency_ms", latencyMs);

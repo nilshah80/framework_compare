@@ -1,5 +1,7 @@
 package benchmark;
 
+import benchmark.pgstore.*;
+import benchmark.pgstore.Order;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.vertx.core.Vertx;
@@ -13,21 +15,18 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 public class Application {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final ConcurrentHashMap<String, OrderResponse> store = new ConcurrentHashMap<>();
-    private static final ConcurrentHashMap<String, UserProfile> profileStore = new ConcurrentHashMap<>();
-    private static final AtomicLong counter = new AtomicLong(0);
+    private static PgStore store;
 
     private static final Set<String> SENSITIVE_HEADERS = Set.of(
             "authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token"
     );
 
-    // --- Models ---
+    // --- Request/Response Models ---
 
     public record OrderRequest(List<Item> items, String currency) {}
 
@@ -85,6 +84,13 @@ public class Application {
     // --- Main ---
 
     public static void main(String[] args) {
+        String dsn = System.getenv("PG_DSN");
+        if (dsn == null || dsn.isBlank()) {
+            dsn = "postgres://postgres:postgres@localhost:5432/benchmark?sslmode=disable";
+        }
+        store = new PgStore(dsn);
+        store.initSchema();
+
         Vertx vertx = Vertx.vertx();
         Router router = Router.router(vertx);
 
@@ -184,19 +190,18 @@ public class Application {
             String requestId = ctx.get("requestId");
             OrderRequest body = MAPPER.readValue(ctx.body().asString(), OrderRequest.class);
 
-            String orderId = String.valueOf(counter.incrementAndGet());
-            double total = 0;
-            if (body.items() != null) {
-                for (var item : body.items()) {
-                    total += item.price() * item.quantity();
-                }
-            }
-            String currency = (body.currency() == null || body.currency().isBlank()) ? "USD" : body.currency();
+            List<OrderItem> items = body.items().stream()
+                .map(i -> new OrderItem(i.productId(), i.name(), i.quantity(), i.price()))
+                .collect(Collectors.toList());
 
-            var order = new OrderResponse(orderId, userId, "created", body.items(), total, currency, null, requestId);
-            store.put(userId + ":" + orderId, order);
+            Order order = store.createOrder(userId, items, body.currency());
 
-            sendJson(ctx, 201, order);
+            List<Item> responseItems = order.items().stream()
+                .map(i -> new Item(i.productId(), i.name(), i.quantity(), i.price()))
+                .collect(Collectors.toList());
+
+            sendJson(ctx, 201, new OrderResponse(order.orderId(), order.userId(), order.status(),
+                responseItems, order.total(), order.currency(), null, requestId));
         } catch (Exception e) {
             ctx.fail(e);
         }
@@ -209,25 +214,23 @@ public class Application {
             String requestId = ctx.get("requestId");
             OrderRequest body = MAPPER.readValue(ctx.body().asString(), OrderRequest.class);
 
-            String key = userId + ":" + orderId;
-            OrderResponse existing = store.get(key);
-            if (existing == null) {
+            List<OrderItem> items = body.items().stream()
+                .map(i -> new OrderItem(i.productId(), i.name(), i.quantity(), i.price()))
+                .collect(Collectors.toList());
+
+            Optional<Order> updated = store.updateOrder(userId, orderId, items, body.currency());
+            if (updated.isEmpty()) {
                 sendJson(ctx, 404, new ErrorResponse("order not found"));
                 return;
             }
 
-            double total = 0;
-            if (body.items() != null) {
-                for (var item : body.items()) {
-                    total += item.price() * item.quantity();
-                }
-            }
-            String currency = (body.currency() == null || body.currency().isBlank()) ? "USD" : body.currency();
+            Order o = updated.get();
+            List<Item> responseItems = o.items().stream()
+                .map(i -> new Item(i.productId(), i.name(), i.quantity(), i.price()))
+                .collect(Collectors.toList());
 
-            var updated = new OrderResponse(orderId, userId, "updated", body.items(), total, currency, null, requestId);
-            store.put(key, updated);
-
-            sendJson(ctx, 200, updated);
+            sendJson(ctx, 200, new OrderResponse(o.orderId(), o.userId(), o.status(),
+                responseItems, o.total(), o.currency(), null, requestId));
         } catch (Exception e) {
             ctx.fail(e);
         }
@@ -239,9 +242,8 @@ public class Application {
             String orderId = ctx.pathParam("orderId");
             String requestId = ctx.get("requestId");
 
-            String key = userId + ":" + orderId;
-            OrderResponse existing = store.remove(key);
-            if (existing == null) {
+            boolean deleted = store.deleteOrder(userId, orderId);
+            if (!deleted) {
                 sendJson(ctx, 404, new ErrorResponse("order not found"));
                 return;
             }
@@ -259,16 +261,19 @@ public class Application {
             String requestId = ctx.get("requestId");
             String fields = ctx.request().getParam("fields", "*");
 
-            String key = userId + ":" + orderId;
-            OrderResponse existing = store.get(key);
-            if (existing == null) {
+            Optional<Order> result = store.getOrder(userId, orderId);
+            if (result.isEmpty()) {
                 sendJson(ctx, 404, new ErrorResponse("order not found"));
                 return;
             }
 
-            var result = new OrderResponse(existing.orderId(), existing.userId(), existing.status(),
-                    existing.items(), existing.total(), existing.currency(), fields, requestId);
-            sendJson(ctx, 200, result);
+            Order o = result.get();
+            List<Item> responseItems = o.items().stream()
+                .map(i -> new Item(i.productId(), i.name(), i.quantity(), i.price()))
+                .collect(Collectors.toList());
+
+            sendJson(ctx, 200, new OrderResponse(o.orderId(), o.userId(), o.status(),
+                    responseItems, o.total(), o.currency(), fields, requestId));
         } catch (Exception e) {
             ctx.fail(e);
         }
@@ -280,25 +285,27 @@ public class Application {
             String requestId = ctx.get("requestId");
             BulkOrderRequest body = MAPPER.readValue(ctx.body().asString(), BulkOrderRequest.class);
 
-            List<OrderResponse> results = new ArrayList<>();
-            double totalSum = 0;
+            List<BulkOrderInput> inputs = body.orders().stream()
+                .map(orderReq -> new BulkOrderInput(
+                    orderReq.items().stream()
+                        .map(i -> new OrderItem(i.productId(), i.name(), i.quantity(), i.price()))
+                        .collect(Collectors.toList()),
+                    orderReq.currency()))
+                .collect(Collectors.toList());
 
-            for (var orderReq : body.orders()) {
-                String orderId = String.valueOf(counter.incrementAndGet());
-                double total = 0;
-                if (orderReq.items() != null) {
-                    for (var item : orderReq.items()) {
-                        total += item.price() * item.quantity();
-                    }
-                }
-                String currency = (orderReq.currency() == null || orderReq.currency().isBlank()) ? "USD" : orderReq.currency();
-                var order = new OrderResponse(orderId, userId, "created", orderReq.items(), total, currency, null, requestId);
-                store.put(userId + ":" + orderId, order);
-                results.add(order);
-                totalSum += total;
+            BulkResult bulkResult = store.bulkCreateOrders(userId, inputs);
+
+            List<OrderResponse> results = new ArrayList<>();
+            for (int i = 0; i < bulkResult.orders().size(); i++) {
+                Order o = bulkResult.orders().get(i);
+                List<Item> responseItems = o.items().stream()
+                    .map(it -> new Item(it.productId(), it.name(), it.quantity(), it.price()))
+                    .collect(Collectors.toList());
+                results.add(new OrderResponse(o.orderId(), o.userId(), o.status(),
+                    responseItems, o.total(), o.currency(), null, requestId));
             }
 
-            sendJson(ctx, 201, new BulkOrderResponse(userId, results.size(), results, totalSum, requestId));
+            sendJson(ctx, 201, new BulkOrderResponse(userId, results.size(), results, bulkResult.totalSum(), requestId));
         } catch (Exception e) {
             ctx.fail(e);
         }
@@ -308,14 +315,17 @@ public class Application {
         try {
             String userId = ctx.pathParam("userId");
             String requestId = ctx.get("requestId");
-            String prefix = userId + ":";
-            List<OrderResponse> results = new ArrayList<>();
 
-            store.forEach((key, value) -> {
-                if (key.startsWith(prefix)) {
-                    results.add(value);
-                }
-            });
+            List<Order> pgOrders = store.listOrders(userId);
+            List<OrderResponse> results = pgOrders.stream()
+                .map(o -> {
+                    List<Item> responseItems = o.items().stream()
+                        .map(i -> new Item(i.productId(), i.name(), i.quantity(), i.price()))
+                        .collect(Collectors.toList());
+                    return new OrderResponse(o.orderId(), o.userId(), o.status(),
+                        responseItems, o.total(), o.currency(), null, requestId);
+                })
+                .collect(Collectors.toList());
 
             Map<String, Object> response = new LinkedHashMap<>();
             response.put("user_id", userId);
@@ -335,9 +345,11 @@ public class Application {
             String requestId = ctx.get("requestId");
             UserProfile body = MAPPER.readValue(ctx.body().asString(), UserProfile.class);
 
+            benchmark.pgstore.Profile pgProfile = toStoreProfile(body);
+            store.upsertProfile(userId, pgProfile);
+
             var profile = new UserProfile(userId, body.name(), body.email(), body.phone(),
                 body.address(), body.preferences(), body.paymentMethods(), body.tags(), body.metadata(), requestId);
-            profileStore.put(userId, profile);
 
             sendJson(ctx, 200, profile);
         } catch (Exception e) {
@@ -350,18 +362,78 @@ public class Application {
             String userId = ctx.pathParam("userId");
             String requestId = ctx.get("requestId");
 
-            UserProfile profile = profileStore.get(userId);
-            if (profile == null) {
+            Optional<benchmark.pgstore.Profile> result = store.getProfile(userId);
+            if (result.isEmpty()) {
                 sendJson(ctx, 404, new ErrorResponse("profile not found"));
                 return;
             }
 
-            var withReqId = new UserProfile(profile.userId(), profile.name(), profile.email(), profile.phone(),
-                profile.address(), profile.preferences(), profile.paymentMethods(), profile.tags(), profile.metadata(), requestId);
+            benchmark.pgstore.Profile p = result.get();
+            var withReqId = fromStoreProfile(p, requestId);
             sendJson(ctx, 200, withReqId);
         } catch (Exception e) {
             ctx.fail(e);
         }
+    }
+
+    // --- Profile conversion ---
+
+    private static benchmark.pgstore.Profile toStoreProfile(UserProfile body) {
+        benchmark.pgstore.Address addr = null;
+        if (body.address() != null) {
+            addr = new benchmark.pgstore.Address(body.address().street(), body.address().city(),
+                body.address().state(), body.address().zip(), body.address().country());
+        }
+        benchmark.pgstore.Preferences prefs = null;
+        if (body.preferences() != null) {
+            benchmark.pgstore.NotificationPrefs np = null;
+            if (body.preferences().notifications() != null) {
+                np = new benchmark.pgstore.NotificationPrefs(
+                    body.preferences().notifications().email(),
+                    body.preferences().notifications().sms(),
+                    body.preferences().notifications().push());
+            }
+            prefs = new benchmark.pgstore.Preferences(body.preferences().language(),
+                body.preferences().currency(), body.preferences().timezone(), np, body.preferences().theme());
+        }
+        List<benchmark.pgstore.PaymentMethod> pms = null;
+        if (body.paymentMethods() != null) {
+            pms = body.paymentMethods().stream()
+                .map(pm -> new benchmark.pgstore.PaymentMethod(pm.type(), pm.last4(),
+                    pm.expiryMonth(), pm.expiryYear(), pm.isDefault()))
+                .collect(Collectors.toList());
+        }
+        return new benchmark.pgstore.Profile(body.userId(), body.name(), body.email(), body.phone(),
+            addr, prefs, pms, body.tags(), body.metadata());
+    }
+
+    private static UserProfile fromStoreProfile(benchmark.pgstore.Profile p, String requestId) {
+        Address addr = null;
+        if (p.address() != null) {
+            addr = new Address(p.address().street(), p.address().city(),
+                p.address().state(), p.address().zip(), p.address().country());
+        }
+        Preferences prefs = null;
+        if (p.preferences() != null) {
+            NotificationPrefs np = null;
+            if (p.preferences().notifications() != null) {
+                np = new NotificationPrefs(
+                    p.preferences().notifications().email(),
+                    p.preferences().notifications().sms(),
+                    p.preferences().notifications().push());
+            }
+            prefs = new Preferences(p.preferences().language(),
+                p.preferences().currency(), p.preferences().timezone(), np, p.preferences().theme());
+        }
+        List<PaymentMethod> pms = null;
+        if (p.paymentMethods() != null) {
+            pms = p.paymentMethods().stream()
+                .map(pm -> new PaymentMethod(pm.type(), pm.last4(),
+                    pm.expiryMonth(), pm.expiryYear(), pm.isDefault()))
+                .collect(Collectors.toList());
+        }
+        return new UserProfile(p.userId(), p.name(), p.email(), p.phone(),
+            addr, prefs, pms, p.tags(), p.metadata(), requestId);
     }
 
     // --- Utility ---
@@ -384,14 +456,6 @@ public class Application {
             });
 
             Map<String, String> queryParams = new HashMap<>();
-            ctx.request().params().forEach(entry -> {
-                // skip path params
-                if (!entry.getKey().equals("userId") && !entry.getKey().equals("orderId")) {
-                    queryParams.put(entry.getKey(), entry.getValue());
-                }
-            });
-            // re-read query params properly
-            queryParams.clear();
             String queryString = ctx.request().query();
             if (queryString != null && !queryString.isEmpty()) {
                 for (String param : queryString.split("&")) {
@@ -413,6 +477,17 @@ public class Application {
 
             String requestId = ctx.get("requestId");
 
+            // Client IP from X-Forwarded-For
+            String clientIp = ctx.request().getHeader("X-Forwarded-For");
+            if (clientIp != null && !clientIp.isBlank()) {
+                clientIp = clientIp.split(",")[0].trim();
+            } else {
+                clientIp = ctx.request().remoteAddress() != null ? ctx.request().remoteAddress().host() : "";
+            }
+
+            // Request body
+            String requestBody = ctx.body() != null ? ctx.body().asString() : "";
+
             Map<String, Object> logEntry = new LinkedHashMap<>();
             logEntry.put("level", "INFO");
             logEntry.put("message", "http_dump");
@@ -420,9 +495,10 @@ public class Application {
             logEntry.put("method", ctx.request().method().name());
             logEntry.put("path", ctx.request().path());
             logEntry.put("query", queryParams);
-            logEntry.put("client_ip", ctx.request().remoteAddress() != null ? ctx.request().remoteAddress().host() : "");
+            logEntry.put("client_ip", clientIp);
             logEntry.put("user_agent", ctx.request().getHeader("User-Agent"));
             logEntry.put("request_headers", reqHeaders);
+            logEntry.put("request_body", requestBody != null ? requestBody : "");
             logEntry.put("status", status);
             logEntry.put("latency", formatLatency(elapsed));
             logEntry.put("latency_ms", latencyMs);

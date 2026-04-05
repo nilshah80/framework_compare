@@ -1,10 +1,17 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using PgStore;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
+
+// ── PgStore singleton ────────────────────────────────────────────────
+var pgDsn = Environment.GetEnvironmentVariable("PG_DSN")
+    ?? throw new InvalidOperationException("PG_DSN environment variable is required");
+var pgStore = new PgStore.PgStore(pgDsn);
+await pgStore.InitSchemaAsync();
+builder.Services.AddSingleton(pgStore);
 
 builder.Services.AddCors(options =>
 {
@@ -68,6 +75,13 @@ app.Use(async (context, next) =>
 app.Use(async (context, next) =>
 {
     var sw = Stopwatch.StartNew();
+
+    // Capture request body
+    context.Request.EnableBuffering();
+    using var reqReader = new StreamReader(context.Request.Body, leaveOpen: true);
+    var requestBody = await reqReader.ReadToEndAsync();
+    context.Request.Body.Position = 0;
+
     var originalBody = context.Response.Body;
     using var memStream = new MemoryStream();
     context.Response.Body = memStream;
@@ -83,6 +97,8 @@ app.Use(async (context, next) =>
 
     var requestId = context.Items["RequestId"]?.ToString() ?? "";
     var query = context.Request.Query.ToDictionary(q => q.Key, q => q.Value.ToString());
+    var clientIp = context.Request.Headers["X-Forwarded-For"].FirstOrDefault()
+        ?? context.Connection.RemoteIpAddress?.ToString() ?? "";
 
     LogEntry("INFO", "http_dump", new
     {
@@ -90,9 +106,10 @@ app.Use(async (context, next) =>
         method = context.Request.Method,
         path = context.Request.Path.Value,
         query,
-        client_ip = context.Connection.RemoteIpAddress?.ToString() ?? "",
+        client_ip = clientIp,
         user_agent = context.Request.Headers.UserAgent.ToString(),
         request_headers = RedactHeaders(context.Request.Headers),
+        request_body = requestBody,
         status = context.Response.StatusCode,
         latency = $"{sw.Elapsed.TotalMilliseconds:F3}ms",
         latency_ms = Math.Round(sw.Elapsed.TotalMilliseconds, 3),
@@ -102,129 +119,58 @@ app.Use(async (context, next) =>
     });
 });
 
-// ── In-memory store ──────────────────────────────────────────────────
-var orderStore = new ConcurrentDictionary<string, OrderResponse>();
-var profileStore = new ConcurrentDictionary<string, UserProfile>();
-var orderCounter = 0;
-
-string NextOrderId() => Interlocked.Increment(ref orderCounter).ToString();
-string StoreKey(string userId, string orderId) => $"{userId}:{orderId}";
-
 // ── Routes ───────────────────────────────────────────────────────────
 
-app.MapPost("/users/{userId}/orders", (HttpContext ctx, string userId, CreateOrderReq req) =>
+app.MapPost("/users/{userId}/orders", async (HttpContext ctx, string userId, CreateOrderReq req, PgStore.PgStore s) =>
 {
-    var total = 0.0;
-    foreach (var item in req.Items ?? [])
-        total += item.Price * item.Quantity;
-
-    var orderId = NextOrderId();
+    var items = MapItems(req.Items);
+    var order = await s.CreateOrderAsync(userId, items, req.Currency);
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
-    var order = new OrderResponse
-    {
-        OrderId = orderId,
-        UserId = userId,
-        Status = "created",
-        Items = req.Items ?? [],
-        Total = total,
-        Currency = string.IsNullOrEmpty(req.Currency) ? "USD" : req.Currency,
-        Fields = "",
-        RequestId = requestId
-    };
-
-    orderStore[StoreKey(userId, orderId)] = order;
-    return Results.Created($"/users/{userId}/orders/{orderId}", order);
+    return Results.Created($"/users/{userId}/orders/{order.OrderId}", ToResponse(order, "", requestId));
 });
 
-app.MapPut("/users/{userId}/orders/{orderId}", (HttpContext ctx, string userId, string orderId, CreateOrderReq req) =>
+app.MapPut("/users/{userId}/orders/{orderId}", async (HttpContext ctx, string userId, string orderId, CreateOrderReq req, PgStore.PgStore s) =>
 {
-    var key = StoreKey(userId, orderId);
-    if (!orderStore.ContainsKey(key))
+    var items = MapItems(req.Items);
+    var order = await s.UpdateOrderAsync(userId, orderId, items, req.Currency);
+    if (order is null)
         return Results.Json(new { error = "order not found" }, statusCode: 404);
 
-    var total = 0.0;
-    foreach (var item in req.Items ?? [])
-        total += item.Price * item.Quantity;
-
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
-    var order = new OrderResponse
-    {
-        OrderId = orderId,
-        UserId = userId,
-        Status = "updated",
-        Items = req.Items ?? [],
-        Total = total,
-        Currency = string.IsNullOrEmpty(req.Currency) ? "USD" : req.Currency,
-        Fields = "",
-        RequestId = requestId
-    };
-
-    orderStore[key] = order;
-    return Results.Ok(order);
+    return Results.Ok(ToResponse(order, "", requestId));
 });
 
-app.MapDelete("/users/{userId}/orders/{orderId}", (HttpContext ctx, string userId, string orderId) =>
+app.MapDelete("/users/{userId}/orders/{orderId}", async (HttpContext ctx, string userId, string orderId, PgStore.PgStore s) =>
 {
-    var key = StoreKey(userId, orderId);
-    if (!orderStore.TryRemove(key, out _))
+    var deleted = await s.DeleteOrderAsync(userId, orderId);
+    if (!deleted)
         return Results.Json(new { error = "order not found" }, statusCode: 404);
 
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
     return Results.Ok(new { message = "order deleted", order_id = orderId, request_id = requestId });
 });
 
-app.MapGet("/users/{userId}/orders/{orderId}", (HttpContext ctx, string userId, string orderId, string? fields) =>
+app.MapGet("/users/{userId}/orders/{orderId}", async (HttpContext ctx, string userId, string orderId, string? fields, PgStore.PgStore s) =>
 {
-    var key = StoreKey(userId, orderId);
-    if (!orderStore.TryGetValue(key, out var order))
+    var order = await s.GetOrderAsync(userId, orderId);
+    if (order is null)
         return Results.Json(new { error = "order not found" }, statusCode: 404);
 
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
-    var result = new OrderResponse
-    {
-        OrderId = order.OrderId,
-        UserId = order.UserId,
-        Status = order.Status,
-        Items = order.Items,
-        Total = order.Total,
-        Currency = order.Currency,
-        Fields = fields ?? "*",
-        RequestId = requestId
-    };
-
-    return Results.Ok(result);
+    return Results.Ok(ToResponse(order, fields ?? "*", requestId));
 });
 
-// POST /users/{userId}/orders/bulk — Bulk Create Orders
-app.MapPost("/users/{userId}/orders/bulk", (HttpContext ctx, string userId, BulkCreateOrderReq req) =>
+app.MapPost("/users/{userId}/orders/bulk", async (HttpContext ctx, string userId, BulkCreateOrderReq req, PgStore.PgStore s) =>
 {
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
-    var results = new List<OrderResponse>();
-    var totalSum = 0.0;
-
-    foreach (var item in req.Orders ?? [])
+    var inputs = (req.Orders ?? []).Select(o => new BulkOrderInput
     {
-        var total = 0.0;
-        foreach (var i in item.Items ?? [])
-            total += i.Price * i.Quantity;
+        Items = MapItems(o.Items),
+        Currency = o.Currency
+    }).ToList();
 
-        var orderId = NextOrderId();
-        var order = new OrderResponse
-        {
-            OrderId = orderId,
-            UserId = userId,
-            Status = "created",
-            Items = item.Items ?? [],
-            Total = total,
-            Currency = string.IsNullOrEmpty(item.Currency) ? "USD" : item.Currency,
-            Fields = "",
-            RequestId = requestId
-        };
-
-        orderStore[StoreKey(userId, orderId)] = order;
-        results.Add(order);
-        totalSum += total;
-    }
+    var (orders, totalSum) = await s.BulkCreateOrdersAsync(userId, inputs);
+    var results = orders.Select(o => ToResponse(o, "", requestId)).ToList();
 
     return Results.Created($"/users/{userId}/orders", new BulkOrderResponse
     {
@@ -236,22 +182,11 @@ app.MapPost("/users/{userId}/orders/bulk", (HttpContext ctx, string userId, Bulk
     });
 });
 
-// GET /users/{userId}/orders — List All Orders
-app.MapGet("/users/{userId}/orders", (HttpContext ctx, string userId) =>
+app.MapGet("/users/{userId}/orders", async (HttpContext ctx, string userId, PgStore.PgStore s) =>
 {
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
-    var prefix = $"{userId}:";
-    var results = new List<OrderResponse>();
-
-    foreach (var kvp in orderStore)
-    {
-        if (kvp.Key.StartsWith(prefix))
-        {
-            var order = kvp.Value;
-            order.RequestId = requestId;
-            results.Add(order);
-        }
-    }
+    var orders = await s.ListOrdersAsync(userId);
+    var results = orders.Select(o => ToResponse(o, "", requestId)).ToList();
 
     return Results.Ok(new ListOrdersResponse
     {
@@ -262,31 +197,98 @@ app.MapGet("/users/{userId}/orders", (HttpContext ctx, string userId) =>
     });
 });
 
-// PUT /users/{userId}/profile — Create/Update Profile
-app.MapPut("/users/{userId}/profile", (HttpContext ctx, string userId, UserProfile profile) =>
+app.MapPut("/users/{userId}/profile", async (HttpContext ctx, string userId, UserProfile profile, PgStore.PgStore s) =>
 {
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
-    profile.UserId = userId;
-    profile.RequestId = requestId;
-    profileStore[userId] = profile;
-    return Results.Ok(profile);
+    var p = MapProfile(profile);
+    await s.UpsertProfileAsync(userId, p);
+    return Results.Ok(ToProfileResp(p, requestId));
 });
 
-// GET /users/{userId}/profile — Get Profile
-app.MapGet("/users/{userId}/profile", (HttpContext ctx, string userId) =>
+app.MapGet("/users/{userId}/profile", async (HttpContext ctx, string userId, PgStore.PgStore s) =>
 {
     var requestId = ctx.Items["RequestId"]?.ToString() ?? "";
-    if (!profileStore.TryGetValue(userId, out var profile))
+    var profile = await s.GetProfileAsync(userId);
+    if (profile is null)
         return Results.Json(new { error = "profile not found" }, statusCode: 404);
 
-    profile.RequestId = requestId;
-    return Results.Ok(profile);
+    return Results.Ok(ToProfileResp(profile, requestId));
 });
 
 LogEntry("INFO", "server starting", new { port = "8093" });
 app.Run();
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+static List<PgStore.OrderItem> MapItems(List<OrderItem>? items) =>
+    (items ?? []).Select(i => new PgStore.OrderItem
+    {
+        ProductId = i.ProductId, Name = i.Name, Quantity = i.Quantity, Price = i.Price
+    }).ToList();
+
+static OrderResponse ToResponse(Order o, string fields, string requestId) => new()
+{
+    OrderId = o.OrderId, UserId = o.UserId, Status = o.Status,
+    Items = o.Items.Select(i => new OrderItem
+    {
+        ProductId = i.ProductId, Name = i.Name, Quantity = i.Quantity, Price = i.Price
+    }).ToList(),
+    Total = o.Total, Currency = o.Currency, Fields = fields, RequestId = requestId
+};
+
+static Profile MapProfile(UserProfile r) => new()
+{
+    Name = r.Name, Email = r.Email, Phone = r.Phone,
+    Address = new PgStore.Address
+    {
+        Street = r.Address.Street, City = r.Address.City,
+        State = r.Address.State, Zip = r.Address.Zip, Country = r.Address.Country
+    },
+    Preferences = new PgStore.Preferences
+    {
+        Language = r.Preferences.Language, Currency = r.Preferences.Currency,
+        Timezone = r.Preferences.Timezone, Theme = r.Preferences.Theme,
+        Notifications = new PgStore.NotificationPrefs
+        {
+            Email = r.Preferences.Notifications.Email,
+            Sms = r.Preferences.Notifications.Sms,
+            Push = r.Preferences.Notifications.Push
+        }
+    },
+    PaymentMethods = r.PaymentMethods.Select(pm => new PgStore.PaymentMethod
+    {
+        Type = pm.Type, Last4 = pm.Last4, ExpiryMonth = pm.ExpiryMonth,
+        ExpiryYear = pm.ExpiryYear, IsDefault = pm.IsDefault
+    }).ToList(),
+    Tags = r.Tags, Metadata = r.Metadata
+};
+
+static UserProfile ToProfileResp(Profile p, string requestId) => new()
+{
+    UserId = p.UserId, Name = p.Name, Email = p.Email, Phone = p.Phone,
+    Address = new Address
+    {
+        Street = p.Address.Street, City = p.Address.City,
+        State = p.Address.State, Zip = p.Address.Zip, Country = p.Address.Country
+    },
+    Preferences = new Preferences
+    {
+        Language = p.Preferences.Language, Currency = p.Preferences.Currency,
+        Timezone = p.Preferences.Timezone, Theme = p.Preferences.Theme,
+        Notifications = new NotificationPrefs
+        {
+            Email = p.Preferences.Notifications.Email,
+            Sms = p.Preferences.Notifications.Sms,
+            Push = p.Preferences.Notifications.Push
+        }
+    },
+    PaymentMethods = p.PaymentMethods.Select(pm => new PaymentMethod
+    {
+        Type = pm.Type, Last4 = pm.Last4, ExpiryMonth = pm.ExpiryMonth,
+        ExpiryYear = pm.ExpiryYear, IsDefault = pm.IsDefault
+    }).ToList(),
+    Tags = p.Tags, Metadata = p.Metadata, RequestId = requestId
+};
 
 static void LogEntry(string level, string msg, object fields)
 {

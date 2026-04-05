@@ -5,9 +5,14 @@ using controller_api;
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
 
+// ── PgStore singleton ────────────────────────────────────────────────
+var pgDsn = Environment.GetEnvironmentVariable("PG_DSN")
+    ?? throw new InvalidOperationException("PG_DSN environment variable is required");
+var pgStore = new PgStore.PgStore(pgDsn);
+await pgStore.InitSchemaAsync();
+builder.Services.AddSingleton(pgStore);
+
 builder.Services.AddControllers();
-builder.Services.AddSingleton<OrderStore>();
-builder.Services.AddSingleton<ProfileStore>();
 
 builder.Services.AddCors(options =>
 {
@@ -71,6 +76,13 @@ app.Use(async (context, next) =>
 app.Use(async (context, next) =>
 {
     var sw = Stopwatch.StartNew();
+
+    // Capture request body
+    context.Request.EnableBuffering();
+    using var reqReader = new StreamReader(context.Request.Body, leaveOpen: true);
+    var requestBody = await reqReader.ReadToEndAsync();
+    context.Request.Body.Position = 0;
+
     var originalBody = context.Response.Body;
     using var memStream = new MemoryStream();
     context.Response.Body = memStream;
@@ -86,6 +98,8 @@ app.Use(async (context, next) =>
 
     var requestId = context.Items["RequestId"]?.ToString() ?? "";
     var query = context.Request.Query.ToDictionary(q => q.Key, q => q.Value.ToString());
+    var clientIp = context.Request.Headers["X-Forwarded-For"].FirstOrDefault()
+        ?? context.Connection.RemoteIpAddress?.ToString() ?? "";
 
     Helpers.LogEntry("INFO", "http_dump", new
     {
@@ -93,9 +107,10 @@ app.Use(async (context, next) =>
         method = context.Request.Method,
         path = context.Request.Path.Value,
         query,
-        client_ip = context.Connection.RemoteIpAddress?.ToString() ?? "",
+        client_ip = clientIp,
         user_agent = context.Request.Headers.UserAgent.ToString(),
         request_headers = Helpers.RedactHeaders(context.Request.Headers),
+        request_body = requestBody,
         status = context.Response.StatusCode,
         latency = $"{sw.Elapsed.TotalMilliseconds:F3}ms",
         latency_ms = Math.Round(sw.Elapsed.TotalMilliseconds, 3),

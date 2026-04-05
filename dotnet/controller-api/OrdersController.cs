@@ -1,69 +1,38 @@
 using Microsoft.AspNetCore.Mvc;
+using PgStore;
 
 namespace controller_api;
 
 [ApiController]
 [Route("users/{userId}/orders")]
-public class OrdersController(OrderStore store) : ControllerBase
+public class OrdersController(PgStore.PgStore store) : ControllerBase
 {
     [HttpPost]
-    public IActionResult CreateOrder(string userId, [FromBody] CreateOrderReq req)
+    public async Task<IActionResult> CreateOrder(string userId, [FromBody] CreateOrderReq req)
     {
-        var total = 0.0;
-        foreach (var item in req.Items ?? [])
-            total += item.Price * item.Quantity;
-
-        var orderId = store.NextOrderId();
+        var items = Mapping.MapItems(req.Items);
+        var order = await store.CreateOrderAsync(userId, items, req.Currency);
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-        var order = new OrderResponse
-        {
-            OrderId = orderId,
-            UserId = userId,
-            Status = "created",
-            Items = req.Items ?? [],
-            Total = total,
-            Currency = string.IsNullOrEmpty(req.Currency) ? "USD" : req.Currency,
-            Fields = "",
-            RequestId = requestId
-        };
-
-        store.Set(OrderStore.Key(userId, orderId), order);
-        return StatusCode(201, order);
+        return StatusCode(201, Mapping.ToResponse(order, "", requestId));
     }
 
     [HttpPut("{orderId}")]
-    public IActionResult UpdateOrder(string userId, string orderId, [FromBody] CreateOrderReq req)
+    public async Task<IActionResult> UpdateOrder(string userId, string orderId, [FromBody] CreateOrderReq req)
     {
-        var key = OrderStore.Key(userId, orderId);
-        if (!store.Contains(key))
+        var items = Mapping.MapItems(req.Items);
+        var order = await store.UpdateOrderAsync(userId, orderId, items, req.Currency);
+        if (order is null)
             return NotFound(new { error = "order not found" });
 
-        var total = 0.0;
-        foreach (var item in req.Items ?? [])
-            total += item.Price * item.Quantity;
-
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-        var order = new OrderResponse
-        {
-            OrderId = orderId,
-            UserId = userId,
-            Status = "updated",
-            Items = req.Items ?? [],
-            Total = total,
-            Currency = string.IsNullOrEmpty(req.Currency) ? "USD" : req.Currency,
-            Fields = "",
-            RequestId = requestId
-        };
-
-        store.Set(key, order);
-        return Ok(order);
+        return Ok(Mapping.ToResponse(order, "", requestId));
     }
 
     [HttpDelete("{orderId}")]
-    public IActionResult DeleteOrder(string userId, string orderId)
+    public async Task<IActionResult> DeleteOrder(string userId, string orderId)
     {
-        var key = OrderStore.Key(userId, orderId);
-        if (!store.TryRemove(key))
+        var deleted = await store.DeleteOrderAsync(userId, orderId);
+        if (!deleted)
             return NotFound(new { error = "order not found" });
 
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
@@ -71,58 +40,28 @@ public class OrdersController(OrderStore store) : ControllerBase
     }
 
     [HttpGet("{orderId}")]
-    public IActionResult GetOrder(string userId, string orderId, [FromQuery] string? fields)
+    public async Task<IActionResult> GetOrder(string userId, string orderId, [FromQuery] string? fields)
     {
-        var key = OrderStore.Key(userId, orderId);
-        if (!store.TryGet(key, out var order) || order is null)
+        var order = await store.GetOrderAsync(userId, orderId);
+        if (order is null)
             return NotFound(new { error = "order not found" });
 
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-        var result = new OrderResponse
-        {
-            OrderId = order.OrderId,
-            UserId = order.UserId,
-            Status = order.Status,
-            Items = order.Items,
-            Total = order.Total,
-            Currency = order.Currency,
-            Fields = fields ?? "*",
-            RequestId = requestId
-        };
-
-        return Ok(result);
+        return Ok(Mapping.ToResponse(order, fields ?? "*", requestId));
     }
 
     [HttpPost("bulk")]
-    public IActionResult BulkCreateOrders(string userId, [FromBody] BulkCreateOrderReq req)
+    public async Task<IActionResult> BulkCreateOrders(string userId, [FromBody] BulkCreateOrderReq req)
     {
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-        var results = new List<OrderResponse>();
-        var totalSum = 0.0;
-
-        foreach (var item in req.Orders ?? [])
+        var inputs = (req.Orders ?? []).Select(o => new BulkOrderInput
         {
-            var total = 0.0;
-            foreach (var i in item.Items ?? [])
-                total += i.Price * i.Quantity;
+            Items = Mapping.MapItems(o.Items),
+            Currency = o.Currency
+        }).ToList();
 
-            var orderId = store.NextOrderId();
-            var order = new OrderResponse
-            {
-                OrderId = orderId,
-                UserId = userId,
-                Status = "created",
-                Items = item.Items ?? [],
-                Total = total,
-                Currency = string.IsNullOrEmpty(item.Currency) ? "USD" : item.Currency,
-                Fields = "",
-                RequestId = requestId
-            };
-
-            store.Set(OrderStore.Key(userId, orderId), order);
-            results.Add(order);
-            totalSum += total;
-        }
+        var (orders, totalSum) = await store.BulkCreateOrdersAsync(userId, inputs);
+        var results = orders.Select(o => Mapping.ToResponse(o, "", requestId)).ToList();
 
         return StatusCode(201, new BulkOrderResponse
         {
@@ -135,18 +74,17 @@ public class OrdersController(OrderStore store) : ControllerBase
     }
 
     [HttpGet]
-    public IActionResult ListOrders(string userId)
+    public async Task<IActionResult> ListOrders(string userId)
     {
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-        var orders = store.GetByUser(userId);
-        foreach (var o in orders)
-            o.RequestId = requestId;
+        var orders = await store.ListOrdersAsync(userId);
+        var results = orders.Select(o => Mapping.ToResponse(o, "", requestId)).ToList();
 
         return Ok(new ListOrdersResponse
         {
             UserId = userId,
-            Count = orders.Count,
-            Orders = orders,
+            Count = results.Count,
+            Orders = results,
             RequestId = requestId
         });
     }
@@ -154,26 +92,98 @@ public class OrdersController(OrderStore store) : ControllerBase
 
 [ApiController]
 [Route("users/{userId}/profile")]
-public class ProfileController(ProfileStore profileStore) : ControllerBase
+public class ProfileController(PgStore.PgStore store) : ControllerBase
 {
     [HttpPut]
-    public IActionResult UpdateProfile(string userId, [FromBody] UserProfile profile)
+    public async Task<IActionResult> UpdateProfile(string userId, [FromBody] UserProfile profile)
     {
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-        profile.UserId = userId;
-        profile.RequestId = requestId;
-        profileStore.Set(userId, profile);
-        return Ok(profile);
+        var p = Mapping.MapProfile(profile);
+        await store.UpsertProfileAsync(userId, p);
+        return Ok(Mapping.ToProfileResp(p, requestId));
     }
 
     [HttpGet]
-    public IActionResult GetProfile(string userId)
+    public async Task<IActionResult> GetProfile(string userId)
     {
         var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-        if (!profileStore.TryGet(userId, out var profile) || profile is null)
+        var profile = await store.GetProfileAsync(userId);
+        if (profile is null)
             return NotFound(new { error = "profile not found" });
 
-        profile.RequestId = requestId;
-        return Ok(profile);
+        return Ok(Mapping.ToProfileResp(profile, requestId));
     }
+}
+
+public static class Mapping
+{
+    public static List<PgStore.OrderItem> MapItems(List<OrderItem>? items) =>
+        (items ?? []).Select(i => new PgStore.OrderItem
+        {
+            ProductId = i.ProductId, Name = i.Name, Quantity = i.Quantity, Price = i.Price
+        }).ToList();
+
+    public static OrderResponse ToResponse(Order o, string fields, string requestId) => new()
+    {
+        OrderId = o.OrderId, UserId = o.UserId, Status = o.Status,
+        Items = o.Items.Select(i => new OrderItem
+        {
+            ProductId = i.ProductId, Name = i.Name, Quantity = i.Quantity, Price = i.Price
+        }).ToList(),
+        Total = o.Total, Currency = o.Currency, Fields = fields, RequestId = requestId
+    };
+
+    public static Profile MapProfile(UserProfile r) => new()
+    {
+        Name = r.Name, Email = r.Email, Phone = r.Phone,
+        Address = new PgStore.Address
+        {
+            Street = r.Address.Street, City = r.Address.City,
+            State = r.Address.State, Zip = r.Address.Zip, Country = r.Address.Country
+        },
+        Preferences = new PgStore.Preferences
+        {
+            Language = r.Preferences.Language, Currency = r.Preferences.Currency,
+            Timezone = r.Preferences.Timezone, Theme = r.Preferences.Theme,
+            Notifications = new PgStore.NotificationPrefs
+            {
+                Email = r.Preferences.Notifications.Email,
+                Sms = r.Preferences.Notifications.Sms,
+                Push = r.Preferences.Notifications.Push
+            }
+        },
+        PaymentMethods = r.PaymentMethods.Select(pm => new PgStore.PaymentMethod
+        {
+            Type = pm.Type, Last4 = pm.Last4, ExpiryMonth = pm.ExpiryMonth,
+            ExpiryYear = pm.ExpiryYear, IsDefault = pm.IsDefault
+        }).ToList(),
+        Tags = r.Tags, Metadata = r.Metadata
+    };
+
+    public static UserProfile ToProfileResp(Profile p, string requestId) => new()
+    {
+        UserId = p.UserId, Name = p.Name, Email = p.Email, Phone = p.Phone,
+        Address = new Address
+        {
+            Street = p.Address.Street, City = p.Address.City,
+            State = p.Address.State, Zip = p.Address.Zip, Country = p.Address.Country
+        },
+        Preferences = new Preferences
+        {
+            Language = p.Preferences.Language, Currency = p.Preferences.Currency,
+            Timezone = p.Preferences.Timezone, Theme = p.Preferences.Theme,
+            Notifications = new NotificationPrefs
+            {
+                Email = p.Preferences.Notifications.Email,
+                Sms = p.Preferences.Notifications.Sms,
+                Push = p.Preferences.Notifications.Push
+            }
+        },
+        PaymentMethods = p.PaymentMethods.Select(pm => new PaymentMethod
+        {
+            Type = pm.Type, Last4 = pm.Last4, ExpiryMonth = pm.ExpiryMonth,
+            ExpiryYear = pm.ExpiryYear, IsDefault = pm.IsDefault
+        }).ToList(),
+        Tags = p.Tags, Metadata = p.Metadata, RequestId = requestId
+    };
 }

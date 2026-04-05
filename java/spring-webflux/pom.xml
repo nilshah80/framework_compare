@@ -25,6 +25,11 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
+        <dependency>
+            <groupId>benchmark</groupId>
+            <artifactId>pgstore</artifactId>
+            <version>1.0.0</version>
+        </dependency>
     </dependencies>
 
     <build>

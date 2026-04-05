@@ -2,27 +2,52 @@ process.env.NODE_ENV = "production";
 
 const express = require("express");
 const crypto = require("crypto");
+const PgStore = require("../pgstore");
 
 const app = express();
 const PORT = 8091;
 
-// ── In-memory store ──────────────────────────────────────────────────
-const orderStore = new Map();
-const profileStore = new Map();
-let orderCounter = 0;
-
-function nextOrderID() {
-  return String(++orderCounter);
-}
-
-function storeKey(userId, orderId) {
-  return `${userId}:${orderId}`;
-}
+let store;
 
 // ── Structured JSON logger setup ─────────────────────────────────────
 function log(level, msg, fields) {
   const entry = { time: new Date().toISOString(), level, msg, ...fields };
   process.stdout.write(JSON.stringify(entry) + "\n");
+}
+
+// ── PII redaction helpers ────────────────────────────────────────────
+const REDACTED_HEADERS = new Set([
+  "authorization",
+  "cookie",
+  "set-cookie",
+  "x-api-key",
+  "x-auth-token",
+]);
+
+const REDACTED_BODY_FIELDS = new Set([
+  "password",
+  "token",
+  "secret",
+  "api_key",
+  "ssn",
+  "credit_card",
+]);
+
+function redactHeaders(headers) {
+  const out = {};
+  for (const [k, v] of Object.entries(headers)) {
+    out[k] = REDACTED_HEADERS.has(k.toLowerCase()) ? "[REDACTED]" : v;
+  }
+  return out;
+}
+
+function redactBody(body) {
+  if (typeof body !== "object" || body === null) return body;
+  const out = {};
+  for (const [k, v] of Object.entries(body)) {
+    out[k] = REDACTED_BODY_FIELDS.has(k) ? "[REDACTED]" : v;
+  }
+  return out;
 }
 
 // ── Middleware: Recovery ──────────────────────────────────────────────
@@ -94,41 +119,6 @@ app.use((req, res, next) => {
 // ── JSON body parser ─────────────────────────────────────────────────
 app.use(express.json({ limit: "1mb" }));
 
-// ── PII redaction helpers ────────────────────────────────────────────
-const REDACTED_HEADERS = new Set([
-  "authorization",
-  "cookie",
-  "set-cookie",
-  "x-api-key",
-  "x-auth-token",
-]);
-
-const REDACTED_BODY_FIELDS = new Set([
-  "password",
-  "token",
-  "secret",
-  "api_key",
-  "ssn",
-  "credit_card",
-]);
-
-function redactHeaders(headers) {
-  const out = {};
-  for (const [k, v] of Object.entries(headers)) {
-    out[k] = REDACTED_HEADERS.has(k.toLowerCase()) ? "[REDACTED]" : v;
-  }
-  return out;
-}
-
-function redactBody(body) {
-  if (typeof body !== "object" || body === null) return body;
-  const out = {};
-  for (const [k, v] of Object.entries(body)) {
-    out[k] = REDACTED_BODY_FIELDS.has(k) ? "[REDACTED]" : v;
-  }
-  return out;
-}
-
 // ── Middleware: Structured Logger ─────────────────────────────────────
 app.use((req, res, next) => {
   const start = process.hrtime.bigint();
@@ -140,6 +130,12 @@ app.use((req, res, next) => {
     responseBody = JSON.stringify(body);
     return originalJson(body);
   };
+
+  // Derive client_ip from X-Forwarded-For (match Aarv's RealIP behavior)
+  const forwarded = req.headers["x-forwarded-for"];
+  const clientIp = forwarded
+    ? forwarded.split(",")[0].trim()
+    : req.socket.remoteAddress || "";
 
   res.on("finish", () => {
     const elapsed = Number(process.hrtime.bigint() - start) / 1e6;
@@ -153,9 +149,10 @@ app.use((req, res, next) => {
       method: req.method,
       path: req.path,
       query,
-      client_ip: req.ip,
+      client_ip: clientIp,
       user_agent: req.headers["user-agent"] || "",
       request_headers: redactHeaders(req.headers),
+      request_body: req.body ? redactBody(req.body) : undefined,
       status: res.statusCode,
       latency: `${elapsed.toFixed(3)}ms`,
       latency_ms: parseFloat(elapsed.toFixed(3)),
@@ -171,178 +168,176 @@ app.use((req, res, next) => {
 // ── Routes ───────────────────────────────────────────────────────────
 
 // POST /users/:userId/orders — Create Order
-app.post("/users/:userId/orders", (req, res) => {
-  const { userId } = req.params;
-  const { items, currency } = req.body;
+app.post("/users/:userId/orders", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { items, currency } = req.body;
 
-  let total = 0;
-  for (const item of items || []) {
-    total += item.price * item.quantity;
+    const order = await store.createOrder(userId, items, currency);
+    order.request_id = req.requestId;
+    res.status(201).json(order);
+  } catch (err) {
+    log("ERROR", "create_order_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
   }
-
-  const orderId = nextOrderID();
-  const order = {
-    order_id: orderId,
-    user_id: userId,
-    status: "created",
-    items: items || [],
-    total,
-    currency: currency || "USD",
-    fields: "",
-    request_id: req.requestId,
-  };
-
-  orderStore.set(storeKey(userId, orderId), order);
-  res.status(201).json(order);
 });
 
 // PUT /users/:userId/orders/:orderId — Update Order
-app.put("/users/:userId/orders/:orderId", (req, res) => {
-  const { userId, orderId } = req.params;
-  const key = storeKey(userId, orderId);
+app.put("/users/:userId/orders/:orderId", async (req, res) => {
+  try {
+    const { userId, orderId } = req.params;
+    const { items, currency } = req.body;
 
-  if (!orderStore.has(key)) {
-    return res.status(404).json({ error: "order not found" });
+    const order = await store.updateOrder(userId, orderId, items, currency);
+    if (!order) {
+      return res.status(404).json({ error: "order not found" });
+    }
+
+    order.request_id = req.requestId;
+    res.json(order);
+  } catch (err) {
+    log("ERROR", "update_order_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
   }
-
-  const { items, currency } = req.body;
-  let total = 0;
-  for (const item of items || []) {
-    total += item.price * item.quantity;
-  }
-
-  const order = {
-    order_id: orderId,
-    user_id: userId,
-    status: "updated",
-    items: items || [],
-    total,
-    currency: currency || "USD",
-    fields: "",
-    request_id: req.requestId,
-  };
-
-  orderStore.set(key, order);
-  res.json(order);
 });
 
 // DELETE /users/:userId/orders/:orderId — Delete Order
-app.delete("/users/:userId/orders/:orderId", (req, res) => {
-  const { userId, orderId } = req.params;
-  const key = storeKey(userId, orderId);
+app.delete("/users/:userId/orders/:orderId", async (req, res) => {
+  try {
+    const { userId, orderId } = req.params;
+    const deleted = await store.deleteOrder(userId, orderId);
 
-  if (!orderStore.has(key)) {
-    return res.status(404).json({ error: "order not found" });
+    if (!deleted) {
+      return res.status(404).json({ error: "order not found" });
+    }
+
+    res.json({
+      message: "order deleted",
+      order_id: orderId,
+      request_id: req.requestId,
+    });
+  } catch (err) {
+    log("ERROR", "delete_order_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
   }
-
-  orderStore.delete(key);
-  res.json({
-    message: "order deleted",
-    order_id: orderId,
-    request_id: req.requestId,
-  });
 });
 
 // GET /users/:userId/orders/:orderId — Fetch Order
-app.get("/users/:userId/orders/:orderId", (req, res) => {
-  const { userId, orderId } = req.params;
-  const key = storeKey(userId, orderId);
+app.get("/users/:userId/orders/:orderId", async (req, res) => {
+  try {
+    const { userId, orderId } = req.params;
+    const order = await store.getOrder(userId, orderId);
 
-  if (!orderStore.has(key)) {
-    return res.status(404).json({ error: "order not found" });
+    if (!order) {
+      return res.status(404).json({ error: "order not found" });
+    }
+
+    order.fields = req.query.fields || "*";
+    order.request_id = req.requestId;
+    res.json(order);
+  } catch (err) {
+    log("ERROR", "get_order_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
   }
-
-  const fields = req.query.fields || "*";
-  const token = req.headers["x-api-key"] || "";
-
-  const order = { ...orderStore.get(key) };
-  order.fields = fields;
-  order.request_id = req.requestId;
-
-  res.json(order);
 });
 
 // POST /users/:userId/orders/bulk — Bulk Create Orders
-app.post("/users/:userId/orders/bulk", (req, res) => {
-  const { userId } = req.params;
-  const { orders } = req.body || {};
+app.post("/users/:userId/orders/bulk", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { orders } = req.body || {};
 
-  const results = [];
-  let totalSum = 0;
+    const result = await store.bulkCreateOrders(userId, orders);
 
-  for (const item of orders || []) {
-    let total = 0;
-    for (const i of item.items || []) {
-      total += i.price * i.quantity;
+    for (const o of result.orders) {
+      o.request_id = req.requestId;
     }
 
-    const orderId = nextOrderID();
-    const order = {
-      order_id: orderId,
+    res.status(201).json({
       user_id: userId,
-      status: "created",
-      items: item.items || [],
-      total,
-      currency: item.currency || "USD",
-      fields: "",
+      count: result.orders.length,
+      orders: result.orders,
+      total_sum: result.totalSum,
       request_id: req.requestId,
-    };
-
-    orderStore.set(storeKey(userId, orderId), order);
-    results.push(order);
-    totalSum += total;
+    });
+  } catch (err) {
+    log("ERROR", "bulk_create_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
   }
-
-  res.status(201).json({
-    user_id: userId,
-    count: results.length,
-    orders: results,
-    total_sum: totalSum,
-    request_id: req.requestId,
-  });
 });
 
 // GET /users/:userId/orders — List All Orders
-app.get("/users/:userId/orders", (req, res) => {
-  const { userId } = req.params;
-  const prefix = `${userId}:`;
-  const results = [];
+app.get("/users/:userId/orders", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const orders = await store.listOrders(userId);
 
-  for (const [key, order] of orderStore) {
-    if (key.startsWith(prefix)) {
-      results.push({ ...order, request_id: req.requestId });
+    for (const o of orders) {
+      o.request_id = req.requestId;
     }
-  }
 
-  res.json({
-    user_id: userId,
-    count: results.length,
-    orders: results,
-    request_id: req.requestId,
-  });
+    res.json({
+      user_id: userId,
+      count: orders.length,
+      orders,
+      request_id: req.requestId,
+    });
+  } catch (err) {
+    log("ERROR", "list_orders_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
 // PUT /users/:userId/profile — Create/Update Profile
-app.put("/users/:userId/profile", (req, res) => {
-  const { userId } = req.params;
-  const profile = { ...req.body, user_id: userId, request_id: req.requestId };
-  profileStore.set(userId, profile);
-  res.json(profile);
+app.put("/users/:userId/profile", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    await store.upsertProfile(userId, req.body);
+
+    const profile = { ...req.body, user_id: userId, request_id: req.requestId };
+    res.json(profile);
+  } catch (err) {
+    log("ERROR", "upsert_profile_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
+  }
 });
 
 // GET /users/:userId/profile — Get Profile
-app.get("/users/:userId/profile", (req, res) => {
-  const { userId } = req.params;
+app.get("/users/:userId/profile", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const profile = await store.getProfile(userId);
 
-  if (!profileStore.has(userId)) {
-    return res.status(404).json({ error: "profile not found" });
+    if (!profile) {
+      return res.status(404).json({ error: "profile not found" });
+    }
+
+    profile.request_id = req.requestId;
+    res.json(profile);
+  } catch (err) {
+    log("ERROR", "get_profile_failed", { error: err.message });
+    res.status(500).json({ error: "Internal Server Error" });
   }
-
-  const profile = { ...profileStore.get(userId), request_id: req.requestId };
-  res.json(profile);
 });
 
 // ── Start server ─────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  log("INFO", "server starting", { port: String(PORT) });
+async function main() {
+  const dsn = process.env.PG_DSN;
+  if (!dsn) {
+    console.error("PG_DSN environment variable is required");
+    process.exit(1);
+  }
+
+  store = new PgStore(dsn);
+  await store.initSchema();
+  log("INFO", "using PostgreSQL store", { dsn: dsn.replace(/\/\/.*@/, "//***@") });
+
+  app.listen(PORT, () => {
+    log("INFO", "server starting", { port: String(PORT) });
+  });
+}
+
+main().catch((err) => {
+  log("ERROR", "startup failed", { error: err.message });
+  process.exit(1);
 });

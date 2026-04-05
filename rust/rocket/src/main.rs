@@ -1,4 +1,4 @@
-use dashmap::DashMap;
+use pgstore::{BulkOrderInput, PgStore};
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::http::{Header, Method, Status};
 use rocket::request::{FromRequest, Outcome, Request};
@@ -8,7 +8,6 @@ use rocket::{catch, catchers, launch, post, put, delete, get, routes, Build, Roc
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -18,7 +17,7 @@ use uuid::Uuid;
 struct OrderItem {
     product_id: String,
     name: String,
-    quantity: u64,
+    quantity: i64,
     price: f64,
 }
 
@@ -157,21 +156,124 @@ struct PaymentMethod {
     is_default: bool,
 }
 
-// ─── Store ───
+// ─── Conversion helpers ───
 
-struct AppState {
-    store: DashMap<String, StoredOrder>,
-    profiles: DashMap<String, UserProfile>,
-    next_id: AtomicU64,
+fn to_pgstore_items(items: &[OrderItem]) -> Vec<pgstore::OrderItem> {
+    items
+        .iter()
+        .map(|i| pgstore::OrderItem {
+            product_id: i.product_id.clone(),
+            name: i.name.clone(),
+            quantity: i.quantity,
+            price: i.price,
+        })
+        .collect()
 }
 
-#[derive(Debug, Clone)]
-struct StoredOrder {
-    order_id: String,
-    user_id: String,
-    items: Vec<OrderItem>,
-    total: f64,
-    currency: String,
+fn from_pgstore_items(items: &[pgstore::OrderItem]) -> Vec<OrderItem> {
+    items
+        .iter()
+        .map(|i| OrderItem {
+            product_id: i.product_id.clone(),
+            name: i.name.clone(),
+            quantity: i.quantity,
+            price: i.price,
+        })
+        .collect()
+}
+
+fn order_to_response(o: pgstore::Order, request_id: String) -> OrderResponse {
+    OrderResponse {
+        order_id: o.order_id,
+        user_id: o.user_id,
+        status: o.status,
+        items: from_pgstore_items(&o.items),
+        total: o.total,
+        currency: o.currency,
+        fields: "*".to_string(),
+        request_id,
+    }
+}
+
+fn profile_to_user(p: pgstore::Profile, request_id: String) -> UserProfile {
+    UserProfile {
+        user_id: p.user_id,
+        name: p.name,
+        email: p.email,
+        phone: p.phone,
+        address: Address {
+            street: p.address.street,
+            city: p.address.city,
+            state: p.address.state,
+            zip: p.address.zip,
+            country: p.address.country,
+        },
+        preferences: ProfilePreferences {
+            language: p.preferences.language,
+            currency: p.preferences.currency,
+            timezone: p.preferences.timezone,
+            notifications: NotificationPrefs {
+                email: p.preferences.notifications.email,
+                sms: p.preferences.notifications.sms,
+                push: p.preferences.notifications.push,
+            },
+            theme: p.preferences.theme,
+        },
+        payment_methods: p
+            .payment_methods
+            .iter()
+            .map(|pm| PaymentMethod {
+                type_: pm.type_.clone(),
+                last4: pm.last4.clone(),
+                expiry_month: pm.expiry_month,
+                expiry_year: pm.expiry_year,
+                is_default: pm.is_default,
+            })
+            .collect(),
+        tags: p.tags,
+        metadata: p.metadata,
+        request_id,
+    }
+}
+
+fn user_to_profile(u: &UserProfile) -> pgstore::Profile {
+    pgstore::Profile {
+        user_id: u.user_id.clone(),
+        name: u.name.clone(),
+        email: u.email.clone(),
+        phone: u.phone.clone(),
+        address: pgstore::Address {
+            street: u.address.street.clone(),
+            city: u.address.city.clone(),
+            state: u.address.state.clone(),
+            zip: u.address.zip.clone(),
+            country: u.address.country.clone(),
+        },
+        preferences: pgstore::Preferences {
+            language: u.preferences.language.clone(),
+            currency: u.preferences.currency.clone(),
+            timezone: u.preferences.timezone.clone(),
+            notifications: pgstore::NotificationPrefs {
+                email: u.preferences.notifications.email,
+                sms: u.preferences.notifications.sms,
+                push: u.preferences.notifications.push,
+            },
+            theme: u.preferences.theme.clone(),
+        },
+        payment_methods: u
+            .payment_methods
+            .iter()
+            .map(|pm| pgstore::PaymentMethod {
+                type_: pm.type_.clone(),
+                last4: pm.last4.clone(),
+                expiry_month: pm.expiry_month,
+                expiry_year: pm.expiry_year,
+                is_default: pm.is_default,
+            })
+            .collect(),
+        tags: u.tags.clone(),
+        metadata: u.metadata.clone(),
+    }
 }
 
 // ─── Request ID guard ───
@@ -304,6 +406,18 @@ fn redact_headers(headers: &[(&str, &str)]) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+fn extract_client_ip(req: &Request<'_>) -> String {
+    if let Some(xff) = req.headers().get_one("X-Forwarded-For") {
+        let first = xff.split(',').next().unwrap_or("").trim();
+        if !first.is_empty() {
+            return first.to_string();
+        }
+    }
+    req.client_ip()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
 #[rocket::async_trait]
 impl Fairing for LoggerFairing {
     fn info(&self) -> Info {
@@ -327,6 +441,8 @@ impl Fairing for LoggerFairing {
             .or_else(|| response.headers().get_one("X-Request-ID"))
             .unwrap_or("-")
             .to_string();
+
+        let client_ip = extract_client_ip(req);
 
         let req_headers_owned: Vec<(String, String)> = req
             .headers()
@@ -381,9 +497,10 @@ impl Fairing for LoggerFairing {
             "method": req.method().as_str(),
             "path": req.uri().path().to_string(),
             "query": query,
-            "client_ip": req.client_ip().map(|ip| ip.to_string()).unwrap_or("-".to_string()),
+            "client_ip": client_ip,
             "user_agent": req.headers().get_one("User-Agent").unwrap_or("-"),
             "request_headers": redact_headers(&req_headers),
+            "request_body": "",
             "status": response.status().code,
             "latency": format!("{:?}", latency),
             "latency_ms": latency.as_secs_f64() * 1000.0,
@@ -421,318 +538,280 @@ fn not_found() -> Json<ErrorResponse> {
 // ─── Routes ───
 
 #[post("/users/<user_id>/orders", format = "json", data = "<body>")]
-fn create_order(
+async fn create_order(
     user_id: &str,
     body: Json<OrderRequest>,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> JsonBody<OrderResponse> {
-    let id = state.next_id.fetch_add(1, Ordering::SeqCst);
-    let order_id = id.to_string();
-    let total: f64 = body.items.iter().map(|i| i.price * i.quantity as f64).sum();
-    let currency = if body.currency.is_empty() {
-        "USD".to_string()
-    } else {
-        body.currency.clone()
-    };
+) -> JsonBody<serde_json::Value> {
+    let items = to_pgstore_items(&body.items);
+    let currency = if body.currency.is_empty() { "USD" } else { &body.currency };
 
-    let stored = StoredOrder {
-        order_id: order_id.clone(),
-        user_id: user_id.to_string(),
-        items: body.items.clone(),
-        total,
-        currency: currency.clone(),
-    };
-    state
-        .store
-        .insert(format!("{}:{}", user_id, order_id), stored);
-
-    JsonBody {
-        status: Status::Created,
-        request_id: req_id.0.clone(),
-        body: OrderResponse {
-            order_id,
-            user_id: user_id.to_string(),
-            status: "created".to_string(),
-            items: body.items.clone(),
-            total,
-            currency,
-            fields: "*".to_string(),
-            request_id: req_id.0,
+    match state.create_order(user_id, &items, currency).await {
+        Ok(order) => {
+            let resp = order_to_response(order, req_id.0.clone());
+            JsonBody {
+                status: Status::Created,
+                request_id: req_id.0,
+                body: serde_json::to_value(resp).unwrap(),
+            }
+        }
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
+            request_id: req_id.0.clone(),
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
         },
     }
 }
 
 #[put("/users/<user_id>/orders/<order_id>", format = "json", data = "<body>")]
-fn update_order(
+async fn update_order(
     user_id: &str,
     order_id: &str,
     body: Json<OrderRequest>,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> Result<JsonBody<OrderResponse>, JsonBody<ErrorResponse>> {
-    let key = format!("{}:{}", user_id, order_id);
-    if !state.store.contains_key(&key) {
-        return Err(JsonBody {
+) -> JsonBody<serde_json::Value> {
+    let items = to_pgstore_items(&body.items);
+    let currency = if body.currency.is_empty() { "USD" } else { &body.currency };
+
+    match state.update_order(user_id, order_id, &items, currency).await {
+        Ok(Some(order)) => {
+            let resp = order_to_response(order, req_id.0.clone());
+            JsonBody {
+                status: Status::Ok,
+                request_id: req_id.0,
+                body: serde_json::to_value(resp).unwrap(),
+            }
+        }
+        Ok(None) => JsonBody {
             status: Status::NotFound,
             request_id: req_id.0.clone(),
-            body: ErrorResponse {
-                error: "order not found".to_string(),
-            },
-        });
-    }
-
-    let total: f64 = body.items.iter().map(|i| i.price * i.quantity as f64).sum();
-    let currency = if body.currency.is_empty() {
-        "USD".to_string()
-    } else {
-        body.currency.clone()
-    };
-
-    let stored = StoredOrder {
-        order_id: order_id.to_string(),
-        user_id: user_id.to_string(),
-        items: body.items.clone(),
-        total,
-        currency: currency.clone(),
-    };
-    state.store.insert(key, stored);
-
-    Ok(JsonBody {
-        status: Status::Ok,
-        request_id: req_id.0.clone(),
-        body: OrderResponse {
-            order_id: order_id.to_string(),
-            user_id: user_id.to_string(),
-            status: "updated".to_string(),
-            items: body.items.clone(),
-            total,
-            currency,
-            fields: "*".to_string(),
-            request_id: req_id.0,
+            body: serde_json::json!({"error": "order not found"}),
         },
-    })
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
+            request_id: req_id.0.clone(),
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
+        },
+    }
 }
 
 #[delete("/users/<user_id>/orders/<order_id>")]
-fn delete_order(
+async fn delete_order(
     user_id: &str,
     order_id: &str,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> Result<JsonBody<DeleteResponse>, JsonBody<ErrorResponse>> {
-    let key = format!("{}:{}", user_id, order_id);
-    match state.store.remove(&key) {
-        Some(_) => Ok(JsonBody {
+) -> JsonBody<serde_json::Value> {
+    match state.delete_order(user_id, order_id).await {
+        Ok(true) => JsonBody {
             status: Status::Ok,
             request_id: req_id.0.clone(),
-            body: DeleteResponse {
+            body: serde_json::to_value(DeleteResponse {
                 message: "order deleted".to_string(),
                 order_id: order_id.to_string(),
                 request_id: req_id.0,
-            },
-        }),
-        None => Err(JsonBody {
+            })
+            .unwrap(),
+        },
+        Ok(false) => JsonBody {
             status: Status::NotFound,
             request_id: req_id.0.clone(),
-            body: ErrorResponse {
-                error: "order not found".to_string(),
-            },
-        }),
+            body: serde_json::json!({"error": "order not found"}),
+        },
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
+            request_id: req_id.0.clone(),
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
+        },
     }
 }
 
 #[get("/users/<user_id>/orders/<order_id>?<fields>")]
-fn get_order(
+async fn get_order(
     user_id: &str,
     order_id: &str,
     fields: Option<&str>,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> Result<JsonBody<OrderResponse>, JsonBody<ErrorResponse>> {
-    let key = format!("{}:{}", user_id, order_id);
-    match state.store.get(&key) {
-        Some(entry) => {
-            let stored = entry.value();
-            Ok(JsonBody {
+) -> JsonBody<serde_json::Value> {
+    match state.get_order(user_id, order_id).await {
+        Ok(Some(order)) => {
+            let mut resp = order_to_response(order, req_id.0.clone());
+            resp.fields = fields.unwrap_or("*").to_string();
+            JsonBody {
                 status: Status::Ok,
-                request_id: req_id.0.clone(),
-                body: OrderResponse {
-                    order_id: stored.order_id.clone(),
-                    user_id: stored.user_id.clone(),
-                    status: "created".to_string(),
-                    items: stored.items.clone(),
-                    total: stored.total,
-                    currency: stored.currency.clone(),
-                    fields: fields.unwrap_or("*").to_string(),
-                    request_id: req_id.0,
-                },
-            })
+                request_id: req_id.0,
+                body: serde_json::to_value(resp).unwrap(),
+            }
         }
-        None => Err(JsonBody {
+        Ok(None) => JsonBody {
             status: Status::NotFound,
             request_id: req_id.0.clone(),
-            body: ErrorResponse {
-                error: "order not found".to_string(),
-            },
-        }),
+            body: serde_json::json!({"error": "order not found"}),
+        },
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
+            request_id: req_id.0.clone(),
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
+        },
     }
 }
 
 // ─── Bulk + List + Profile Routes ───
 
 #[post("/users/<user_id>/orders/bulk", format = "json", data = "<body>")]
-fn bulk_create_orders(
+async fn bulk_create_orders(
     user_id: &str,
     body: Json<BulkCreateOrderReq>,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> JsonBody<BulkOrderResponse> {
-    let mut results = Vec::new();
-    let mut total_sum = 0.0;
+) -> JsonBody<serde_json::Value> {
+    let inputs: Vec<BulkOrderInput> = body
+        .orders
+        .iter()
+        .map(|o| BulkOrderInput {
+            items: to_pgstore_items(&o.items),
+            currency: if o.currency.is_empty() {
+                "USD".to_string()
+            } else {
+                o.currency.clone()
+            },
+        })
+        .collect();
 
-    for order_req in &body.orders {
-        let id = state.next_id.fetch_add(1, Ordering::SeqCst);
-        let order_id = id.to_string();
-        let total: f64 = order_req.items.iter().map(|i| i.price * i.quantity as f64).sum();
-        let currency = if order_req.currency.is_empty() {
-            "USD".to_string()
-        } else {
-            order_req.currency.clone()
-        };
-
-        let stored = StoredOrder {
-            order_id: order_id.clone(),
-            user_id: user_id.to_string(),
-            items: order_req.items.clone(),
-            total,
-            currency: currency.clone(),
-        };
-        state
-            .store
-            .insert(format!("{}:{}", user_id, order_id), stored);
-
-        results.push(OrderResponse {
-            order_id,
-            user_id: user_id.to_string(),
-            status: "created".to_string(),
-            items: order_req.items.clone(),
-            total,
-            currency,
-            fields: "*".to_string(),
+    match state.bulk_create_orders(user_id, &inputs).await {
+        Ok((orders, total_sum)) => {
+            let results: Vec<OrderResponse> = orders
+                .into_iter()
+                .map(|o| order_to_response(o, req_id.0.clone()))
+                .collect();
+            JsonBody {
+                status: Status::Created,
+                request_id: req_id.0.clone(),
+                body: serde_json::to_value(BulkOrderResponse {
+                    user_id: user_id.to_string(),
+                    count: results.len(),
+                    orders: results,
+                    total_sum,
+                    request_id: req_id.0,
+                })
+                .unwrap(),
+            }
+        }
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
             request_id: req_id.0.clone(),
-        });
-        total_sum += total;
-    }
-
-    JsonBody {
-        status: Status::Created,
-        request_id: req_id.0.clone(),
-        body: BulkOrderResponse {
-            user_id: user_id.to_string(),
-            count: results.len(),
-            orders: results,
-            total_sum,
-            request_id: req_id.0,
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
         },
     }
 }
 
 #[get("/users/<user_id>/orders")]
-fn list_orders(
+async fn list_orders(
     user_id: &str,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> JsonBody<ListOrdersResponse> {
-    let prefix = format!("{}:", user_id);
-    let mut results = Vec::new();
-
-    for entry in state.store.iter() {
-        if entry.key().starts_with(&prefix) {
-            let stored = entry.value();
-            results.push(OrderResponse {
-                order_id: stored.order_id.clone(),
-                user_id: stored.user_id.clone(),
-                status: "created".to_string(),
-                items: stored.items.clone(),
-                total: stored.total,
-                currency: stored.currency.clone(),
-                fields: "*".to_string(),
+) -> JsonBody<serde_json::Value> {
+    match state.list_orders(user_id).await {
+        Ok(orders) => {
+            let results: Vec<OrderResponse> = orders
+                .into_iter()
+                .map(|o| order_to_response(o, req_id.0.clone()))
+                .collect();
+            JsonBody {
+                status: Status::Ok,
                 request_id: req_id.0.clone(),
-            });
+                body: serde_json::to_value(ListOrdersResponse {
+                    user_id: user_id.to_string(),
+                    count: results.len(),
+                    orders: results,
+                    request_id: req_id.0,
+                })
+                .unwrap(),
+            }
         }
-    }
-
-    JsonBody {
-        status: Status::Ok,
-        request_id: req_id.0.clone(),
-        body: ListOrdersResponse {
-            user_id: user_id.to_string(),
-            count: results.len(),
-            orders: results,
-            request_id: req_id.0,
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
+            request_id: req_id.0.clone(),
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
         },
     }
 }
 
 #[put("/users/<user_id>/profile", format = "json", data = "<body>")]
-fn put_profile(
+async fn put_profile(
     user_id: &str,
     body: Json<UserProfile>,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> JsonBody<UserProfile> {
+) -> JsonBody<serde_json::Value> {
     let mut profile = body.into_inner();
     profile.user_id = user_id.to_string();
-    profile.request_id = req_id.0.clone();
 
-    state.profiles.insert(user_id.to_string(), profile.clone());
+    let pg_profile = user_to_profile(&profile);
 
-    JsonBody {
-        status: Status::Ok,
-        request_id: req_id.0,
-        body: profile,
+    match state.upsert_profile(user_id, &pg_profile).await {
+        Ok(()) => {
+            profile.request_id = req_id.0.clone();
+            JsonBody {
+                status: Status::Ok,
+                request_id: req_id.0,
+                body: serde_json::to_value(profile).unwrap(),
+            }
+        }
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
+            request_id: req_id.0.clone(),
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
+        },
     }
 }
 
 #[get("/users/<user_id>/profile")]
-fn get_profile(
+async fn get_profile(
     user_id: &str,
-    state: &State<AppState>,
+    state: &State<PgStore>,
     req_id: ReqId,
-) -> Result<JsonBody<UserProfile>, JsonBody<ErrorResponse>> {
-    match state.profiles.get(user_id) {
-        Some(entry) => {
-            let mut profile = entry.value().clone();
-            profile.request_id = req_id.0.clone();
-            Ok(JsonBody {
+) -> JsonBody<serde_json::Value> {
+    match state.get_profile(user_id).await {
+        Ok(Some(profile)) => {
+            let user = profile_to_user(profile, req_id.0.clone());
+            JsonBody {
                 status: Status::Ok,
                 request_id: req_id.0,
-                body: profile,
-            })
+                body: serde_json::to_value(user).unwrap(),
+            }
         }
-        None => Err(JsonBody {
+        Ok(None) => JsonBody {
             status: Status::NotFound,
             request_id: req_id.0.clone(),
-            body: ErrorResponse {
-                error: "profile not found".to_string(),
-            },
-        }),
+            body: serde_json::json!({"error": "profile not found"}),
+        },
+        Err(e) => JsonBody {
+            status: Status::InternalServerError,
+            request_id: req_id.0.clone(),
+            body: serde_json::json!({"error": format!("db error: {}", e)}),
+        },
     }
 }
 
 // ─── Launch ───
 
 #[launch]
-fn rocket() -> Rocket<Build> {
-    let state = AppState {
-        store: DashMap::new(),
-        profiles: DashMap::new(),
-        next_id: AtomicU64::new(1),
-    };
+async fn rocket() -> Rocket<Build> {
+    let pg_dsn = std::env::var("PG_DSN").expect("PG_DSN environment variable must be set");
+    let pg_store = PgStore::new(&pg_dsn)
+        .await
+        .expect("Failed to connect to PostgreSQL");
+    pg_store
+        .init_schema()
+        .await
+        .expect("Failed to initialize schema");
 
     rocket::build()
-        .manage(state)
+        .manage(pg_store)
         .attach(CorsFairing)
         .attach(SecurityHeadersFairing)
         .attach(LoggerFairing)

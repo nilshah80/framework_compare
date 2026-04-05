@@ -8,4 +8,8 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="../PgStore/PgStore.csproj" />
+  </ItemGroup>
+
 </Project>

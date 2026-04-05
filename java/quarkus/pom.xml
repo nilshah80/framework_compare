@@ -34,6 +34,11 @@
             <groupId>io.quarkus</groupId>
             <artifactId>quarkus-rest-jackson</artifactId>
         </dependency>
+        <dependency>
+            <groupId>benchmark</groupId>
+            <artifactId>pgstore</artifactId>
+            <version>1.0.0</version>
+        </dependency>
     </dependencies>
 
     <build>

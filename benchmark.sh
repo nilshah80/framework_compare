@@ -11,21 +11,60 @@
 #   ./benchmark.sh [duration] [threads] [connections] [cooldown] [filter...]
 #
 # Examples:
-#   ./benchmark.sh                          # all frameworks, defaults
-#   ./benchmark.sh 10s 4 100 20             # all frameworks, custom config
-#   ./benchmark.sh 10s 4 100 20 aarv gin    # only aarv and gin
-#   ./benchmark.sh 10s 4 100 20 fiber       # only fiber
-#   ./benchmark.sh 10s 4 100 20 go          # all Go frameworks
-#   ./benchmark.sh 10s 4 100 20 dotnet      # all .NET frameworks
-#   ./benchmark.sh 10s 4 100 20 node        # all Node frameworks
+#   ./benchmark.sh                                       # all frameworks, defaults
+#   ./benchmark.sh 10s 4 100 20                          # all frameworks, custom config
+#   ./benchmark.sh 10s 4 100 20 aarv gin                 # only aarv and gin
+#   ./benchmark.sh 10s 4 100 20 go                       # all Go frameworks
+#   ./benchmark.sh 10s 4 100 20 rust java                # Rust + Java frameworks
 #
 # Environment variables:
 #   ENDPOINTS   — which endpoints to benchmark (default: all)
-#                 all:  GET, POST, PUT, DELETE, BULK, LIST, PROFILE-PUT, PROFILE-GET
-#                 crud: GET, POST, PUT, DELETE
+#                 all:   GET, POST, PUT, DELETE, BULK, LIST, PROFILE-PUT, PROFILE-GET
+#                 crud:  GET, POST, PUT, DELETE
 #                 large: BULK, LIST, PROFILE-PUT, PROFILE-GET
 #                 comma-separated: get,post,bulk (specific endpoints)
-#   CONSTRAIN   — 0 = direct execution (default), 1 = Docker with resource limits
+#
+#   CONSTRAIN   — 0 = direct execution, 1 = Docker with resource limits (default)
+#                 Docker: --cpus=0.5 --memory=256m per container
+#                 Per-language thread limits: GOMAXPROCS=1, TOKIO_WORKER_THREADS=1, etc.
+#
+#   DB          — memory (default) or pg (PostgreSQL 18)
+#                 pg: uses shared pgstore per language, pool max=50 min=10
+#                 PostgreSQL runs in Docker with --cpus=2 --memory=1g
+#
+# Endpoint names: get, post, put, delete, bulk, list, profile-put, profile-get
+# Language groups: go, rust, java, dotnet, node
+#
+# ── Per-Framework Benchmark Flow ──────────────────────────────
+#
+#   1. Start server
+#   2. Capture idle resource stats (threads, memory, CPU)
+#   3. ── Phase 1: Pre-warm (15s heavy load) ──
+#      - Seed 50 orders for "warmuser"
+#      - 5s GET at full load (warms PG plan cache + connection pool)
+#      - 5s POST at full load (warms INSERT path + JIT/.NET/Java)
+#      - 3s PUT (warms UPDATE path)
+#      - Warm profile endpoints (PUT + GET)
+#      → Ensures PG shared buffers, framework JIT, connection pools,
+#        goroutine schedulers, and tokio runtimes are fully warm
+#   4. ── Phase 2: Clean state ──
+#      - TRUNCATE orders + profiles (reset row count to 0)
+#      - Seed exactly 100 orders (consistent starting state)
+#      → Every framework benchmarks against the same table size
+#   5. Validate all endpoints return expected HTTP status codes
+#   6. Seed profile for PROFILE-GET benchmark
+#   7. Start background peak memory/CPU sampler (every 2s)
+#   8. ── Per-endpoint benchmarks ──
+#      - Each endpoint gets its own 3s warmup before 10s measurement
+#      - Order: GET → POST → PUT → PROFILE-PUT → PROFILE-GET → LIST → BULK → DELETE
+#      - BULK runs last (floods store), DELETE excluded in constrained mode
+#   9. Capture peak + final resource stats
+#   10. Stop server, cool-down before next framework
+#
+# ── PostgreSQL Pre-warm (once at script start) ────────────────
+#   - INSERT 1000 rows → SELECT → UPDATE → DELETE → ANALYZE
+#   - Populates shared_buffers and plan cache before any framework runs
+#
 # ============================================================
 
 DURATION="${1:-10s}"
@@ -40,6 +79,15 @@ LOGS_DIR="$SCRIPT_DIR/logs"
 
 ENDPOINTS="${ENDPOINTS:-all}"
 CONSTRAIN="${CONSTRAIN:-1}"
+DB="${DB:-memory}"  # "memory" (default) or "pg" (PostgreSQL)
+
+# PostgreSQL settings (used when DB=pg)
+PG_DOCKER_NAME="benchmark-postgres"
+PG_PORT=5432
+PG_USER="bench"
+PG_PASS="bench"
+PG_DB="benchmark"
+PG_DSN="postgres://${PG_USER}:${PG_PASS}@localhost:${PG_PORT}/${PG_DB}"
 
 RESULTS_DIR="$SCRIPT_DIR/results"
 mkdir -p "$RESULTS_DIR" "$LOGS_DIR"
@@ -139,6 +187,7 @@ add_fw "echo"             8084 "Go"   "$SCRIPT_DIR/go/echo"             "./echo"
 add_fw "mach"             8085 "Go"   "$SCRIPT_DIR/go/mach"             "./mach"
 add_fw "aarv-segmentio"   8086 "Go"   "$SCRIPT_DIR/go/aarv-segmentio"   "./aarv-segmentio"
 add_fw "chi"              8087 "Go"   "$SCRIPT_DIR/go/chi"              "./chi"
+add_fw "nethttp"          8088 "Go"   "$SCRIPT_DIR/go/nethttp"          "./nethttp"
 
 # .NET frameworks
 add_fw "minimal-api"      8093 ".NET" "$SCRIPT_DIR/dotnet/minimal-api"      "dotnet run -c Release"
@@ -222,6 +271,67 @@ if ! command -v wrk &> /dev/null; then
     exit 1
 fi
 
+# ── PostgreSQL setup (when DB=pg) ─────────────────────────────
+if [ "$DB" = "pg" ]; then
+    if ! command -v docker &> /dev/null; then
+        echo "ERROR: docker is required for DB=pg mode."
+        exit 1
+    fi
+    echo "PostgreSQL mode enabled (DB=pg)"
+    # Start PostgreSQL if not already running
+    if ! docker ps --format '{{.Names}}' | grep -q "^${PG_DOCKER_NAME}$"; then
+        echo "  Starting PostgreSQL 18..."
+        docker rm -f "$PG_DOCKER_NAME" 2>/dev/null || true
+        docker run -d --name "$PG_DOCKER_NAME" \
+            -e POSTGRES_USER="$PG_USER" \
+            -e POSTGRES_PASSWORD="$PG_PASS" \
+            -e POSTGRES_DB="$PG_DB" \
+            -p ${PG_PORT}:5432 \
+            --cpus=2 --memory=1g \
+            postgres:18-alpine > /dev/null
+        echo "  Waiting for PostgreSQL to be ready..."
+        for i in $(seq 1 30); do
+            docker exec "$PG_DOCKER_NAME" pg_isready -U "$PG_USER" -d "$PG_DB" > /dev/null 2>&1 && break
+            sleep 1
+        done
+        echo "  PostgreSQL ready."
+    else
+        echo "  PostgreSQL already running."
+    fi
+
+    # Pre-warm PG shared buffers with dummy data
+    echo "  Pre-warming PostgreSQL shared buffers..."
+    docker exec "$PG_DOCKER_NAME" psql -U "$PG_USER" -d "$PG_DB" -q -c "
+        -- Ensure schema exists
+        CREATE TABLE IF NOT EXISTS orders (
+            id BIGSERIAL PRIMARY KEY, user_id VARCHAR(255) NOT NULL,
+            status VARCHAR(50) NOT NULL DEFAULT 'created', items JSONB NOT NULL DEFAULT '[]',
+            total NUMERIC(12,2) NOT NULL DEFAULT 0, currency VARCHAR(10) NOT NULL DEFAULT 'USD',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id);
+        CREATE TABLE IF NOT EXISTS profiles (user_id VARCHAR(255) PRIMARY KEY, data JSONB NOT NULL DEFAULT '{}');
+        -- Insert and query dummy rows to warm shared buffers + plan cache
+        INSERT INTO orders (user_id, status, items, total, currency)
+            SELECT 'pgwarm', 'created', '[{\"product_id\":\"p1\",\"name\":\"W\",\"quantity\":1,\"price\":10}]'::jsonb, 10, 'USD'
+            FROM generate_series(1, 1000);
+        SELECT * FROM orders WHERE user_id = 'pgwarm' LIMIT 100;
+        UPDATE orders SET status = 'updated' WHERE user_id = 'pgwarm';
+        DELETE FROM orders WHERE user_id = 'pgwarm';
+        ANALYZE orders;
+        ANALYZE profiles;
+    " 2>/dev/null || true
+    echo "  PostgreSQL warmed up."
+    echo ""
+fi
+
+# ── Truncate helper for DB=pg mode ────────────────────────────
+pg_truncate() {
+    if [ "$DB" = "pg" ]; then
+        docker exec "$PG_DOCKER_NAME" psql -U "$PG_USER" -d "$PG_DB" -c "TRUNCATE TABLE orders RESTART IDENTITY; TRUNCATE TABLE profiles;" -q 2>/dev/null || true
+    fi
+}
+
 if [ "$CONSTRAIN" = "1" ]; then
     if ! command -v docker &> /dev/null; then
         echo "ERROR: docker is not installed (required when CONSTRAIN=1)."
@@ -288,6 +398,7 @@ echo "  Cooldown:    ${COOLDOWN}s between frameworks"
 echo "  Frameworks:  $TOTAL"
 echo "  Endpoints:   $ACTIVE_ENDPOINTS"
 echo "  Constrain:   $([ "$CONSTRAIN" = "1" ] && echo "Docker (1 CPU, 512MB)" || echo "None (native)")"
+echo "  Database:    $([ "$DB" = "pg" ] && echo "PostgreSQL 18 (Docker, 2 CPU, 1GB)" || echo "In-memory")"
 echo "  System:      $CPU_CORES cores, $TOTAL_RAM RAM"
 echo "  Timestamp:   $TIMESTAMP"
 RUN_ORDER=""
@@ -316,7 +427,7 @@ echo ""
 
 # ── Helper: wait for server to respond ────────────────────────
 wait_for_server() {
-    local port=$1 max_wait=30 elapsed=0
+    local port=$1 max_wait=90 elapsed=0
     while true; do
         local code
         code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
@@ -501,14 +612,25 @@ docker_build_and_start() {
     local env_args=""
     case "$lang" in
         Go)   env_args="-e GOMAXPROCS=1" ;;
-        Java) env_args="-e JAVA_TOOL_OPTIONS='-XX:ActiveProcessorCount=1 -Xmx384m'" ;;
+        Java) env_args="-e JAVA_TOOL_OPTIONS=-XX:ActiveProcessorCount=1 -e _JAVA_OPTIONS=-Xmx384m" ;;
         Rust) env_args="-e TOKIO_WORKER_THREADS=1" ;;
         .NET) env_args="-e DOTNET_PROCESSOR_COUNT=1" ;;
         Node) env_args="-e UV_THREADPOOL_SIZE=1" ;;
     esac
 
+    # Add PG_DSN if DB=pg mode
+    if [ "$DB" = "pg" ]; then
+        local pg_dsn_docker="postgres://${PG_USER}:${PG_PASS}@host.docker.internal:${PG_PORT}/${PG_DB}"
+        env_args="$env_args -e PG_DSN=$pg_dsn_docker"
+    fi
+
+    # Framework-specific env vars for Docker (port overrides, etc.)
+    case "$fw" in
+        micronaut) env_args="$env_args -e MICRONAUT_SERVER_PORT=${port}" ;;
+    esac
+
     echo "  Starting Docker container $image_name..."
-    docker run --cpus=1 --memory=512m $env_args -p ${port}:${port} --rm -d --name "$image_name" "$image_name" || {
+    docker run --cpus=0.5 --memory=256m $env_args -p ${port}:${port} --rm -d --name "$image_name" "$image_name" || {
         echo "  ERROR: Docker run failed for $fw"
         return 1
     }
@@ -567,7 +689,12 @@ for i in "${INDICES[@]}"; do
 
         # Start server — logs go to a file
         echo "  Starting $fw..."
-        (cd "$dir" && ASPNETCORE_ENVIRONMENT=Production DOTNET_ENVIRONMENT=Production $cmd) > "$LOG_FILE" 2>&1 &
+        (
+            cd "$dir"
+            export ASPNETCORE_ENVIRONMENT=Production DOTNET_ENVIRONMENT=Production
+            [ "$DB" = "pg" ] && export PG_DSN="$PG_DSN"
+            $cmd
+        ) > "$LOG_FILE" 2>&1 &
         SUBSHELL_PID=$!
     fi
 
@@ -592,7 +719,50 @@ for i in "${INDICES[@]}"; do
     IFS='|' read -r IDLE_TH IDLE_MEM IDLE_CPU <<< "$IDLE_STATS"
     echo "  Resources (idle):  Threads=$IDLE_TH  Memory=$IDLE_MEM  CPU=$IDLE_CPU"
 
-    # ── Seed orders and capture a valid order ID ──────────────
+    # ── Phase 1: Pre-warm PG + Framework ────────────────────────
+    # Heavy mixed load to warm up:
+    # - PostgreSQL shared_buffers, plan caches, connection pool
+    # - Framework JIT (.NET/Java), goroutine scheduler (Go), tokio runtime (Rust)
+    # - Connection pool handshakes and prepared statements
+    if [ "$DB" = "pg" ]; then
+        echo "  Phase 1: Pre-warming PG + framework (15s heavy load)..."
+        # Seed some orders for warmup queries
+        for s in $(seq 1 50); do
+            curl -s -o /dev/null -X POST "http://localhost:$port/users/warmuser/orders" \
+                -H "Content-Type: application/json" -H "X-Api-Key: bench-token" \
+                -d "$POST_BODY"
+        done
+        # Heavy mixed GET + POST + PUT to warm everything
+        wrk -t4 -c50 -d5s "http://localhost:$port/users/warmuser/orders/25?fields=id" \
+            -H "X-Api-Key: bench-token" > /dev/null 2>&1 || true
+        wrk -t4 -c50 -d5s -s "$LUA_DIR/wrk_post.lua" \
+            "http://localhost:$port/users/warmuser/orders" > /dev/null 2>&1 || true
+        wrk -t2 -c20 -d3s -s "$LUA_DIR/wrk_put.lua" \
+            "http://localhost:$port/users/warmuser/orders/25" > /dev/null 2>&1 || true
+        # Warm profile endpoints too
+        curl -s -o /dev/null -X PUT "http://localhost:$port/users/warmuser/profile" \
+            -H "Content-Type: application/json" -d "$PROFILE_BODY" 2>/dev/null || true
+        wrk -t2 -c20 -d3s "http://localhost:$port/users/warmuser/profile" \
+            -H "X-Api-Key: bench-token" > /dev/null 2>&1 || true
+        echo "  Pre-warm complete."
+    else
+        # In-memory mode: lighter warmup (just JIT/scheduler)
+        echo "  Pre-warming framework (9s)..."
+        wrk -t2 -c10 -d5s "http://localhost:$port/users/warmuser/orders/1?fields=id" \
+            -H "X-Api-Key: bench-token" > /dev/null 2>&1 || true
+        wrk -t2 -c10 -d2s -s "$LUA_DIR/wrk_post.lua" \
+            "http://localhost:$port/users/warmuser/orders" > /dev/null 2>&1 || true
+        wrk -t2 -c10 -d2s -s "$LUA_DIR/wrk_put.lua" \
+            "http://localhost:$port/users/warmuser/orders/1" > /dev/null 2>&1 || true
+    fi
+    sleep 1
+
+    # ── Phase 2: Truncate + re-seed (clean state for measurement) ──
+    if [ "$DB" = "pg" ]; then
+        echo "  Phase 2: Truncating DB + seeding clean state..."
+        pg_truncate
+    fi
+
     echo "  Seeding 100 orders..."
     ORDER_ID=$(seed_and_get_id "$port" 100)
     if [ -z "$ORDER_ID" ]; then
@@ -647,17 +817,6 @@ for i in "${INDICES[@]}"; do
         echo ""
         continue
     fi
-
-    # Global warmup: exercise all code paths to trigger JIT/compilation
-    # This ensures the first benchmarked endpoint doesn't pay cold-start cost
-    echo "  Global warmup (5s mixed requests)..."
-    wrk -t2 -c10 -d5s "http://localhost:$port/users/user123/orders/$ORDER_ID?fields=id" \
-        -H "X-Api-Key: bench-token" > /dev/null 2>&1 || true
-    wrk -t2 -c10 -d2s -s "$LUA_DIR/wrk_post.lua" \
-        "http://localhost:$port/users/user123/orders" > /dev/null 2>&1 || true
-    wrk -t2 -c10 -d2s -s "$LUA_DIR/wrk_put.lua" \
-        "http://localhost:$port/users/user123/orders/$ORDER_ID" > /dev/null 2>&1 || true
-    sleep 1
 
     RESULT_FILE="$RESULTS_DIR/${fw}_${TIMESTAMP}.txt"
     {

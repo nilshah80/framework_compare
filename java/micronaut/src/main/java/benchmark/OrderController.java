@@ -1,6 +1,8 @@
 package benchmark;
 
 import benchmark.model.*;
+import benchmark.pgstore.*;
+import benchmark.pgstore.Order;
 import io.micronaut.http.HttpRequest;
 import io.micronaut.http.HttpResponse;
 import io.micronaut.http.MediaType;
@@ -9,34 +11,39 @@ import io.micronaut.http.annotation.*;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
 
 @Controller("/users/{userId}")
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
 public class OrderController {
 
-    private final OrderStore store = OrderStore.getInstance();
+    private static final PgStore store;
+
+    static {
+        String dsn = System.getenv("PG_DSN");
+        if (dsn == null || dsn.isBlank()) {
+            dsn = "postgres://postgres:postgres@localhost:5432/benchmark?sslmode=disable";
+        }
+        store = new PgStore(dsn);
+        store.initSchema();
+    }
 
     @Post("/orders")
     public HttpResponse<?> createOrder(@PathVariable String userId,
                                        @Body OrderRequest body,
                                        HttpRequest<?> request) {
         String requestId = getRequestId(request);
-        String orderId = String.valueOf(store.nextId());
+        List<OrderItem> items = body.items().stream()
+            .map(i -> new OrderItem(i.productId(), i.name(), i.quantity(), i.price()))
+            .collect(Collectors.toList());
 
-        double total = 0;
-        if (body.items() != null) {
-            for (var item : body.items()) {
-                total += item.price() * item.quantity();
-            }
-        }
+        Order order = store.createOrder(userId, items, body.currency());
 
-        String currency = (body.currency() == null || body.currency().isBlank()) ? "USD" : body.currency();
-
-        var order = new OrderResponse(orderId, userId, "created", body.items(), total, currency, null, requestId);
-        store.put(userId, orderId, order);
-
-        return HttpResponse.created(order);
+        var resp = new OrderResponse(order.orderId(), order.userId(), order.status(),
+            body.items(), order.total(), order.currency(), null, requestId);
+        return HttpResponse.created(resp);
     }
 
     @Put("/orders/{orderId}")
@@ -45,25 +52,19 @@ public class OrderController {
                                        @Body OrderRequest body,
                                        HttpRequest<?> request) {
         String requestId = getRequestId(request);
+        List<OrderItem> items = body.items().stream()
+            .map(i -> new OrderItem(i.productId(), i.name(), i.quantity(), i.price()))
+            .collect(Collectors.toList());
 
-        OrderResponse existing = store.get(userId, orderId);
-        if (existing == null) {
+        Optional<Order> updated = store.updateOrder(userId, orderId, items, body.currency());
+        if (updated.isEmpty()) {
             return HttpResponse.notFound(new ErrorResponse("order not found"));
         }
 
-        double total = 0;
-        if (body.items() != null) {
-            for (var item : body.items()) {
-                total += item.price() * item.quantity();
-            }
-        }
-
-        String currency = (body.currency() == null || body.currency().isBlank()) ? "USD" : body.currency();
-
-        var updated = new OrderResponse(orderId, userId, "updated", body.items(), total, currency, null, requestId);
-        store.put(userId, orderId, updated);
-
-        return HttpResponse.ok(updated);
+        Order o = updated.get();
+        var resp = new OrderResponse(o.orderId(), o.userId(), o.status(),
+            body.items(), o.total(), o.currency(), null, requestId);
+        return HttpResponse.ok(resp);
     }
 
     @Delete("/orders/{orderId}")
@@ -71,12 +72,10 @@ public class OrderController {
                                        @PathVariable String orderId,
                                        HttpRequest<?> request) {
         String requestId = getRequestId(request);
-
-        OrderResponse existing = store.remove(userId, orderId);
-        if (existing == null) {
+        boolean deleted = store.deleteOrder(userId, orderId);
+        if (!deleted) {
             return HttpResponse.notFound(new ErrorResponse("order not found"));
         }
-
         return HttpResponse.ok(new DeleteResponse("order deleted", orderId, requestId));
     }
 
@@ -86,15 +85,19 @@ public class OrderController {
                                     @QueryValue(defaultValue = "*") String fields,
                                     HttpRequest<?> request) {
         String requestId = getRequestId(request);
-
-        OrderResponse existing = store.get(userId, orderId);
-        if (existing == null) {
+        Optional<Order> result = store.getOrder(userId, orderId);
+        if (result.isEmpty()) {
             return HttpResponse.notFound(new ErrorResponse("order not found"));
         }
 
-        var result = new OrderResponse(existing.orderId(), existing.userId(), existing.status(),
-                existing.items(), existing.total(), existing.currency(), fields, requestId);
-        return HttpResponse.ok(result);
+        Order o = result.get();
+        List<OrderRequest.Item> responseItems = o.items().stream()
+            .map(i -> new OrderRequest.Item(i.productId(), i.name(), i.quantity(), i.price()))
+            .collect(Collectors.toList());
+
+        var resp = new OrderResponse(o.orderId(), o.userId(), o.status(),
+            responseItems, o.total(), o.currency(), fields, requestId);
+        return HttpResponse.ok(resp);
     }
 
     @Post("/orders/bulk")
@@ -102,32 +105,42 @@ public class OrderController {
                                             @Body BulkOrderRequest body,
                                             HttpRequest<?> request) {
         String requestId = getRequestId(request);
-        List<OrderResponse> results = new ArrayList<>();
-        double totalSum = 0;
 
-        for (OrderRequest orderReq : body.orders()) {
-            String orderId = String.valueOf(store.nextId());
-            double total = 0;
-            if (orderReq.items() != null) {
-                for (var item : orderReq.items()) {
-                    total += item.price() * item.quantity();
-                }
-            }
-            String currency = (orderReq.currency() == null || orderReq.currency().isBlank()) ? "USD" : orderReq.currency();
-            var order = new OrderResponse(orderId, userId, "created", orderReq.items(), total, currency, null, requestId);
-            store.put(userId, orderId, order);
-            results.add(order);
-            totalSum += total;
+        List<BulkOrderInput> inputs = body.orders().stream()
+            .map(orderReq -> new BulkOrderInput(
+                orderReq.items().stream()
+                    .map(i -> new OrderItem(i.productId(), i.name(), i.quantity(), i.price()))
+                    .collect(Collectors.toList()),
+                orderReq.currency()))
+            .collect(Collectors.toList());
+
+        BulkResult bulkResult = store.bulkCreateOrders(userId, inputs);
+
+        List<OrderResponse> results = new ArrayList<>();
+        for (int i = 0; i < bulkResult.orders().size(); i++) {
+            Order o = bulkResult.orders().get(i);
+            results.add(new OrderResponse(o.orderId(), o.userId(), o.status(),
+                body.orders().get(i).items(), o.total(), o.currency(), null, requestId));
         }
 
-        return HttpResponse.created(new BulkOrderResponse(userId, results.size(), results, totalSum, requestId));
+        return HttpResponse.created(new BulkOrderResponse(userId, results.size(), results, bulkResult.totalSum(), requestId));
     }
 
     @Get("/orders")
     public HttpResponse<?> listOrders(@PathVariable String userId,
                                       HttpRequest<?> request) {
         String requestId = getRequestId(request);
-        List<OrderResponse> orders = store.listByUser(userId);
+        List<Order> pgOrders = store.listOrders(userId);
+
+        List<OrderResponse> orders = pgOrders.stream()
+            .map(o -> {
+                List<OrderRequest.Item> responseItems = o.items().stream()
+                    .map(i -> new OrderRequest.Item(i.productId(), i.name(), i.quantity(), i.price()))
+                    .collect(Collectors.toList());
+                return new OrderResponse(o.orderId(), o.userId(), o.status(),
+                    responseItems, o.total(), o.currency(), null, requestId);
+            })
+            .collect(Collectors.toList());
 
         return HttpResponse.ok(Map.of(
             "user_id", userId,
@@ -142,9 +155,11 @@ public class OrderController {
                                       @Body UserProfile body,
                                       HttpRequest<?> request) {
         String requestId = getRequestId(request);
+        benchmark.pgstore.Profile pgProfile = toStoreProfile(body);
+        store.upsertProfile(userId, pgProfile);
+
         var profile = new UserProfile(userId, body.name(), body.email(), body.phone(),
             body.address(), body.preferences(), body.paymentMethods(), body.tags(), body.metadata(), requestId);
-        store.putProfile(userId, profile);
         return HttpResponse.ok(profile);
     }
 
@@ -152,16 +167,74 @@ public class OrderController {
     public HttpResponse<?> getProfile(@PathVariable String userId,
                                       HttpRequest<?> request) {
         String requestId = getRequestId(request);
-        UserProfile profile = store.getProfile(userId);
-        if (profile == null) {
+        Optional<benchmark.pgstore.Profile> result = store.getProfile(userId);
+        if (result.isEmpty()) {
             return HttpResponse.notFound(new ErrorResponse("profile not found"));
         }
-        var withReqId = new UserProfile(profile.userId(), profile.name(), profile.email(), profile.phone(),
-            profile.address(), profile.preferences(), profile.paymentMethods(), profile.tags(), profile.metadata(), requestId);
+        benchmark.pgstore.Profile p = result.get();
+        var withReqId = fromStoreProfile(p, requestId);
         return HttpResponse.ok(withReqId);
     }
 
     private String getRequestId(HttpRequest<?> request) {
         return request.getAttribute("requestId", String.class).orElse("");
+    }
+
+    private static benchmark.pgstore.Profile toStoreProfile(UserProfile body) {
+        benchmark.pgstore.Address addr = null;
+        if (body.address() != null) {
+            addr = new benchmark.pgstore.Address(body.address().street(), body.address().city(),
+                body.address().state(), body.address().zip(), body.address().country());
+        }
+        benchmark.pgstore.Preferences prefs = null;
+        if (body.preferences() != null) {
+            benchmark.pgstore.NotificationPrefs np = null;
+            if (body.preferences().notifications() != null) {
+                np = new benchmark.pgstore.NotificationPrefs(
+                    body.preferences().notifications().email(),
+                    body.preferences().notifications().sms(),
+                    body.preferences().notifications().push());
+            }
+            prefs = new benchmark.pgstore.Preferences(body.preferences().language(),
+                body.preferences().currency(), body.preferences().timezone(), np, body.preferences().theme());
+        }
+        List<benchmark.pgstore.PaymentMethod> pms = null;
+        if (body.paymentMethods() != null) {
+            pms = body.paymentMethods().stream()
+                .map(pm -> new benchmark.pgstore.PaymentMethod(pm.type(), pm.last4(),
+                    pm.expiryMonth(), pm.expiryYear(), pm.isDefault()))
+                .collect(Collectors.toList());
+        }
+        return new benchmark.pgstore.Profile(body.userId(), body.name(), body.email(), body.phone(),
+            addr, prefs, pms, body.tags(), body.metadata());
+    }
+
+    private static UserProfile fromStoreProfile(benchmark.pgstore.Profile p, String requestId) {
+        benchmark.model.Address addr = null;
+        if (p.address() != null) {
+            addr = new benchmark.model.Address(p.address().street(), p.address().city(),
+                p.address().state(), p.address().zip(), p.address().country());
+        }
+        benchmark.model.Preferences prefs = null;
+        if (p.preferences() != null) {
+            benchmark.model.NotificationPrefs np = null;
+            if (p.preferences().notifications() != null) {
+                np = new benchmark.model.NotificationPrefs(
+                    p.preferences().notifications().email(),
+                    p.preferences().notifications().sms(),
+                    p.preferences().notifications().push());
+            }
+            prefs = new benchmark.model.Preferences(p.preferences().language(),
+                p.preferences().currency(), p.preferences().timezone(), np, p.preferences().theme());
+        }
+        List<benchmark.model.PaymentMethod> pms = null;
+        if (p.paymentMethods() != null) {
+            pms = p.paymentMethods().stream()
+                .map(pm -> new benchmark.model.PaymentMethod(pm.type(), pm.last4(),
+                    pm.expiryMonth(), pm.expiryYear(), pm.isDefault()))
+                .collect(Collectors.toList());
+        }
+        return new UserProfile(p.userId(), p.name(), p.email(), p.phone(),
+            addr, prefs, pms, p.tags(), p.metadata(), requestId);
     }
 }

@@ -155,7 +155,13 @@ public class CombinedWebFilter implements WebFilter {
                         }
                     }
 
-                    String clientIp = request.getRemoteAddress() != null ? request.getRemoteAddress().getAddress().getHostAddress() : "";
+                    // Client IP from X-Forwarded-For or fallback
+                    String clientIp = request.getHeaders().getFirst("X-Forwarded-For");
+                    if (clientIp != null && !clientIp.isBlank()) {
+                        clientIp = clientIp.split(",")[0].trim();
+                    } else {
+                        clientIp = request.getRemoteAddress() != null ? request.getRemoteAddress().getAddress().getHostAddress() : "";
+                    }
                     String ua = request.getHeaders().getFirst("User-Agent");
                     String body = responseBody.toString();
                     int bytesOut = body.getBytes(StandardCharsets.UTF_8).length;
@@ -170,6 +176,7 @@ public class CombinedWebFilter implements WebFilter {
                     logEntry.put("client_ip", clientIp);
                     logEntry.put("user_agent", ua != null ? ua : "");
                     logEntry.put("request_headers", reqHeaders);
+                    logEntry.put("request_body", "");
                     logEntry.put("status", statusCode);
                     logEntry.put("latency", formatLatency(latencyNs));
                     logEntry.put("latency_ms", latencyMs);

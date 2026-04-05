@@ -1,16 +1,21 @@
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using FastEndpoints;
 using fast_endpoints;
+using PgStore;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Logging.ClearProviders();
 
 builder.Services.AddFastEndpoints();
-builder.Services.AddSingleton<OrderStore>();
-builder.Services.AddSingleton<ProfileStore>();
+
+// ── PgStore singleton ────────────────────────────────────────────────
+var pgDsn = Environment.GetEnvironmentVariable("PG_DSN")
+    ?? throw new InvalidOperationException("PG_DSN environment variable is required");
+var pgStore = new PgStore.PgStore(pgDsn);
+await pgStore.InitSchemaAsync();
+builder.Services.AddSingleton(pgStore);
 
 builder.Services.AddCors(options =>
 {
@@ -74,6 +79,13 @@ app.Use(async (context, next) =>
 app.Use(async (context, next) =>
 {
     var sw = Stopwatch.StartNew();
+
+    // Capture request body
+    context.Request.EnableBuffering();
+    using var reqReader = new StreamReader(context.Request.Body, leaveOpen: true);
+    var requestBody = await reqReader.ReadToEndAsync();
+    context.Request.Body.Position = 0;
+
     var originalBody = context.Response.Body;
     using var memStream = new MemoryStream();
     context.Response.Body = memStream;
@@ -89,6 +101,8 @@ app.Use(async (context, next) =>
 
     var requestId = context.Items["RequestId"]?.ToString() ?? "";
     var query = context.Request.Query.ToDictionary(q => q.Key, q => q.Value.ToString());
+    var clientIp = context.Request.Headers["X-Forwarded-For"].FirstOrDefault()
+        ?? context.Connection.RemoteIpAddress?.ToString() ?? "";
 
     Helpers.LogEntry("INFO", "http_dump", new
     {
@@ -96,9 +110,10 @@ app.Use(async (context, next) =>
         method = context.Request.Method,
         path = context.Request.Path.Value,
         query,
-        client_ip = context.Connection.RemoteIpAddress?.ToString() ?? "",
+        client_ip = clientIp,
         user_agent = context.Request.Headers.UserAgent.ToString(),
         request_headers = Helpers.RedactHeaders(context.Request.Headers),
+        request_body = requestBody,
         status = context.Response.StatusCode,
         latency = $"{sw.Elapsed.TotalMilliseconds:F3}ms",
         latency_ms = Math.Round(sw.Elapsed.TotalMilliseconds, 3),
@@ -117,38 +132,77 @@ app.Run();
 
 namespace fast_endpoints
 {
-    public class OrderStore
+    public static class Mapping
     {
-        private readonly ConcurrentDictionary<string, OrderResponse> _store = new();
-        private int _counter;
-
-        public string NextOrderId() => Interlocked.Increment(ref _counter).ToString();
-        public static string Key(string userId, string orderId) => $"{userId}:{orderId}";
-        public void Set(string key, OrderResponse order) => _store[key] = order;
-        public bool TryGet(string key, out OrderResponse? order) => _store.TryGetValue(key, out order);
-        public bool Contains(string key) => _store.ContainsKey(key);
-        public bool TryRemove(string key) => _store.TryRemove(key, out _);
-
-        public List<OrderResponse> GetByUser(string userId)
-        {
-            var prefix = $"{userId}:";
-            var results = new List<OrderResponse>();
-            foreach (var kvp in _store)
+        public static List<PgStore.OrderItem> MapItems(List<OrderItem>? items) =>
+            (items ?? []).Select(i => new PgStore.OrderItem
             {
-                if (kvp.Key.StartsWith(prefix))
-                    results.Add(kvp.Value);
-            }
-            return results;
-        }
-    }
+                ProductId = i.ProductId, Name = i.Name, Quantity = i.Quantity, Price = i.Price
+            }).ToList();
 
-    public class ProfileStore
-    {
-        private readonly ConcurrentDictionary<string, UserProfile> _store = new();
+        public static OrderResponse ToResponse(PgStore.Order o, string fields, string requestId) => new()
+        {
+            OrderId = o.OrderId, UserId = o.UserId, Status = o.Status,
+            Items = o.Items.Select(i => new OrderItem
+            {
+                ProductId = i.ProductId, Name = i.Name, Quantity = i.Quantity, Price = i.Price
+            }).ToList(),
+            Total = o.Total, Currency = o.Currency, Fields = fields, RequestId = requestId
+        };
 
-        public void Set(string userId, UserProfile profile) => _store[userId] = profile;
+        public static Profile MapProfile(UserProfile r) => new()
+        {
+            Name = r.Name, Email = r.Email, Phone = r.Phone,
+            Address = new PgStore.Address
+            {
+                Street = r.Address.Street, City = r.Address.City,
+                State = r.Address.State, Zip = r.Address.Zip, Country = r.Address.Country
+            },
+            Preferences = new PgStore.Preferences
+            {
+                Language = r.Preferences.Language, Currency = r.Preferences.Currency,
+                Timezone = r.Preferences.Timezone, Theme = r.Preferences.Theme,
+                Notifications = new PgStore.NotificationPrefs
+                {
+                    Email = r.Preferences.Notifications.Email,
+                    Sms = r.Preferences.Notifications.Sms,
+                    Push = r.Preferences.Notifications.Push
+                }
+            },
+            PaymentMethods = r.PaymentMethods.Select(pm => new PgStore.PaymentMethod
+            {
+                Type = pm.Type, Last4 = pm.Last4, ExpiryMonth = pm.ExpiryMonth,
+                ExpiryYear = pm.ExpiryYear, IsDefault = pm.IsDefault
+            }).ToList(),
+            Tags = r.Tags, Metadata = r.Metadata
+        };
 
-        public bool TryGet(string userId, out UserProfile? profile) => _store.TryGetValue(userId, out profile);
+        public static UserProfile ToProfileResp(Profile p, string requestId) => new()
+        {
+            UserId = p.UserId, Name = p.Name, Email = p.Email, Phone = p.Phone,
+            Address = new Address
+            {
+                Street = p.Address.Street, City = p.Address.City,
+                State = p.Address.State, Zip = p.Address.Zip, Country = p.Address.Country
+            },
+            Preferences = new Preferences
+            {
+                Language = p.Preferences.Language, Currency = p.Preferences.Currency,
+                Timezone = p.Preferences.Timezone, Theme = p.Preferences.Theme,
+                Notifications = new NotificationPrefs
+                {
+                    Email = p.Preferences.Notifications.Email,
+                    Sms = p.Preferences.Notifications.Sms,
+                    Push = p.Preferences.Notifications.Push
+                }
+            },
+            PaymentMethods = p.PaymentMethods.Select(pm => new PaymentMethod
+            {
+                Type = pm.Type, Last4 = pm.Last4, ExpiryMonth = pm.ExpiryMonth,
+                ExpiryYear = pm.ExpiryYear, IsDefault = pm.IsDefault
+            }).ToList(),
+            Tags = p.Tags, Metadata = p.Metadata, RequestId = requestId
+        };
     }
 
     public static class Helpers
@@ -348,7 +402,7 @@ namespace fast_endpoints
 
     // ── FastEndpoints ────────────────────────────────────────────────
 
-    public class CreateOrderEndpoint(OrderStore store) : Endpoint<CreateOrderReq, OrderResponse>
+    public class CreateOrderEndpoint(PgStore.PgStore store) : Endpoint<CreateOrderReq, OrderResponse>
     {
         public override void Configure()
         {
@@ -359,32 +413,17 @@ namespace fast_endpoints
         public override async Task HandleAsync(CreateOrderReq req, CancellationToken ct)
         {
             var userId = Route<string>("userId")!;
-            var total = 0.0;
-            foreach (var item in req.Items ?? [])
-                total += item.Price * item.Quantity;
-
-            var orderId = store.NextOrderId();
+            var items = Mapping.MapItems(req.Items);
+            var order = await store.CreateOrderAsync(userId, items, req.Currency, ct);
             var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-            var order = new OrderResponse
-            {
-                OrderId = orderId,
-                UserId = userId,
-                Status = "created",
-                Items = req.Items ?? [],
-                Total = total,
-                Currency = string.IsNullOrEmpty(req.Currency) ? "USD" : req.Currency,
-                Fields = "",
-                RequestId = requestId
-            };
-
-            store.Set(OrderStore.Key(userId, orderId), order);
-            await SendCreatedAtAsync<GetOrderEndpoint>(new { userId, orderId }, order, cancellation: ct);
+            await SendCreatedAtAsync<GetOrderEndpoint>(new { userId, orderId = order.OrderId },
+                Mapping.ToResponse(order, "", requestId), cancellation: ct);
         }
     }
 
     public class UpdateOrderReq : CreateOrderReq;
 
-    public class UpdateOrderEndpoint(OrderStore store) : Endpoint<UpdateOrderReq, OrderResponse>
+    public class UpdateOrderEndpoint(PgStore.PgStore store) : Endpoint<UpdateOrderReq, OrderResponse>
     {
         public override void Configure()
         {
@@ -396,33 +435,17 @@ namespace fast_endpoints
         {
             var userId = Route<string>("userId")!;
             var orderId = Route<string>("orderId")!;
-            var key = OrderStore.Key(userId, orderId);
+            var items = Mapping.MapItems(req.Items);
+            var order = await store.UpdateOrderAsync(userId, orderId, items, req.Currency, ct);
 
-            if (!store.Contains(key))
+            if (order is null)
             {
                 await SendAsync(new OrderResponse(), 404, ct);
                 return;
             }
 
-            var total = 0.0;
-            foreach (var item in req.Items ?? [])
-                total += item.Price * item.Quantity;
-
             var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-            var order = new OrderResponse
-            {
-                OrderId = orderId,
-                UserId = userId,
-                Status = "updated",
-                Items = req.Items ?? [],
-                Total = total,
-                Currency = string.IsNullOrEmpty(req.Currency) ? "USD" : req.Currency,
-                Fields = "",
-                RequestId = requestId
-            };
-
-            store.Set(key, order);
-            await SendOkAsync(order, ct);
+            await SendOkAsync(Mapping.ToResponse(order, "", requestId), ct);
         }
     }
 
@@ -432,7 +455,7 @@ namespace fast_endpoints
         public string OrderId { get; set; } = "";
     }
 
-    public class DeleteOrderEndpoint(OrderStore store) : Endpoint<DeleteOrderReq, DeleteResp>
+    public class DeleteOrderEndpoint(PgStore.PgStore store) : Endpoint<DeleteOrderReq, DeleteResp>
     {
         public override void Configure()
         {
@@ -444,9 +467,9 @@ namespace fast_endpoints
         {
             var userId = Route<string>("userId")!;
             var orderId = Route<string>("orderId")!;
-            var key = OrderStore.Key(userId, orderId);
+            var deleted = await store.DeleteOrderAsync(userId, orderId, ct);
 
-            if (!store.TryRemove(key))
+            if (!deleted)
             {
                 await SendAsync(new DeleteResp(), 404, ct);
                 return;
@@ -470,7 +493,7 @@ namespace fast_endpoints
         public string? Fields { get; set; }
     }
 
-    public class GetOrderEndpoint(OrderStore store) : Endpoint<GetOrderReq, OrderResponse>
+    public class GetOrderEndpoint(PgStore.PgStore store) : Endpoint<GetOrderReq, OrderResponse>
     {
         public override void Configure()
         {
@@ -482,33 +505,21 @@ namespace fast_endpoints
         {
             var userId = Route<string>("userId")!;
             var orderId = Route<string>("orderId")!;
-            var key = OrderStore.Key(userId, orderId);
+            var order = await store.GetOrderAsync(userId, orderId, ct);
 
-            if (!store.TryGet(key, out var order) || order is null)
+            if (order is null)
             {
                 await SendAsync(new OrderResponse(), 404, ct);
                 return;
             }
 
             var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-            var result = new OrderResponse
-            {
-                OrderId = order.OrderId,
-                UserId = order.UserId,
-                Status = order.Status,
-                Items = order.Items,
-                Total = order.Total,
-                Currency = order.Currency,
-                Fields = req.Fields ?? "*",
-                RequestId = requestId
-            };
-
-            await SendOkAsync(result, ct);
+            await SendOkAsync(Mapping.ToResponse(order, req.Fields ?? "*", requestId), ct);
         }
     }
 
     // ── Bulk Create Orders ──────────────────────────────────────────
-    public class BulkCreateOrderEndpoint(OrderStore store) : Endpoint<BulkCreateOrderReq, BulkOrderResponse>
+    public class BulkCreateOrderEndpoint(PgStore.PgStore store) : Endpoint<BulkCreateOrderReq, BulkOrderResponse>
     {
         public override void Configure()
         {
@@ -520,32 +531,14 @@ namespace fast_endpoints
         {
             var userId = Route<string>("userId")!;
             var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-            var results = new List<OrderResponse>();
-            var totalSum = 0.0;
-
-            foreach (var item in req.Orders ?? [])
+            var inputs = (req.Orders ?? []).Select(o => new BulkOrderInput
             {
-                var total = 0.0;
-                foreach (var i in item.Items ?? [])
-                    total += i.Price * i.Quantity;
+                Items = Mapping.MapItems(o.Items),
+                Currency = o.Currency
+            }).ToList();
 
-                var orderId = store.NextOrderId();
-                var order = new OrderResponse
-                {
-                    OrderId = orderId,
-                    UserId = userId,
-                    Status = "created",
-                    Items = item.Items ?? [],
-                    Total = total,
-                    Currency = string.IsNullOrEmpty(item.Currency) ? "USD" : item.Currency,
-                    Fields = "",
-                    RequestId = requestId
-                };
-
-                store.Set(OrderStore.Key(userId, orderId), order);
-                results.Add(order);
-                totalSum += total;
-            }
+            var (orders, totalSum) = await store.BulkCreateOrdersAsync(userId, inputs, ct);
+            var results = orders.Select(o => Mapping.ToResponse(o, "", requestId)).ToList();
 
             await SendAsync(new BulkOrderResponse
             {
@@ -564,7 +557,7 @@ namespace fast_endpoints
         public string UserId { get; set; } = "";
     }
 
-    public class ListOrdersEndpoint(OrderStore store) : Endpoint<ListOrdersReq, ListOrdersResponse>
+    public class ListOrdersEndpoint(PgStore.PgStore store) : Endpoint<ListOrdersReq, ListOrdersResponse>
     {
         public override void Configure()
         {
@@ -576,22 +569,21 @@ namespace fast_endpoints
         {
             var userId = Route<string>("userId")!;
             var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-            var orders = store.GetByUser(userId);
-            foreach (var o in orders)
-                o.RequestId = requestId;
+            var orders = await store.ListOrdersAsync(userId, ct);
+            var results = orders.Select(o => Mapping.ToResponse(o, "", requestId)).ToList();
 
             await SendOkAsync(new ListOrdersResponse
             {
                 UserId = userId,
-                Count = orders.Count,
-                Orders = orders,
+                Count = results.Count,
+                Orders = results,
                 RequestId = requestId
             }, ct);
         }
     }
 
     // ── Update Profile ──────────────────────────────────────────────
-    public class UpdateProfileEndpoint(ProfileStore profileStore) : Endpoint<UserProfile, UserProfile>
+    public class UpdateProfileEndpoint(PgStore.PgStore store) : Endpoint<UserProfile, UserProfile>
     {
         public override void Configure()
         {
@@ -603,10 +595,9 @@ namespace fast_endpoints
         {
             var userId = Route<string>("userId")!;
             var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
-            req.UserId = userId;
-            req.RequestId = requestId;
-            profileStore.Set(userId, req);
-            await SendOkAsync(req, ct);
+            var p = Mapping.MapProfile(req);
+            await store.UpsertProfileAsync(userId, p, ct);
+            await SendOkAsync(Mapping.ToProfileResp(p, requestId), ct);
         }
     }
 
@@ -616,7 +607,7 @@ namespace fast_endpoints
         public string UserId { get; set; } = "";
     }
 
-    public class GetProfileEndpoint(ProfileStore profileStore) : Endpoint<GetProfileReq, UserProfile>
+    public class GetProfileEndpoint(PgStore.PgStore store) : Endpoint<GetProfileReq, UserProfile>
     {
         public override void Configure()
         {
@@ -629,14 +620,14 @@ namespace fast_endpoints
             var userId = Route<string>("userId")!;
             var requestId = HttpContext.Items["RequestId"]?.ToString() ?? "";
 
-            if (!profileStore.TryGet(userId, out var profile) || profile is null)
+            var profile = await store.GetProfileAsync(userId, ct);
+            if (profile is null)
             {
                 await SendAsync(new UserProfile(), 404, ct);
                 return;
             }
 
-            profile.RequestId = requestId;
-            await SendOkAsync(profile, ct);
+            await SendOkAsync(Mapping.ToProfileResp(profile, requestId), ct);
         }
     }
 }

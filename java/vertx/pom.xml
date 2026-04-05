@@ -35,6 +35,11 @@
             <artifactId>jackson-databind</artifactId>
             <version>${jackson.version}</version>
         </dependency>
+        <dependency>
+            <groupId>benchmark</groupId>
+            <artifactId>pgstore</artifactId>
+            <version>1.0.0</version>
+        </dependency>
     </dependencies>
 
     <build>

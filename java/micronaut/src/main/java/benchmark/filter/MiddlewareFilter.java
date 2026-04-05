@@ -90,9 +90,18 @@ public class MiddlewareFilter implements HttpServerFilter {
                     logEntry.put("method", request.getMethodName());
                     logEntry.put("path", request.getPath());
                     logEntry.put("query", queryParams);
-                    logEntry.put("client_ip", request.getRemoteAddress().getAddress().getHostAddress());
+                    // Client IP from X-Forwarded-For
+                    String xff = request.getHeaders().get("X-Forwarded-For");
+                    String clientIp;
+                    if (xff != null && !xff.isBlank()) {
+                        clientIp = xff.split(",")[0].trim();
+                    } else {
+                        clientIp = request.getRemoteAddress().getAddress().getHostAddress();
+                    }
+                    logEntry.put("client_ip", clientIp);
                     logEntry.put("user_agent", request.getHeaders().get("User-Agent"));
                     logEntry.put("request_headers", reqHeaders);
+                    logEntry.put("request_body", "");
                     logEntry.put("status", response.code());
                     logEntry.put("latency", formatLatency(elapsed));
                     logEntry.put("latency_ms", latencyMs);

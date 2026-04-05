@@ -1,11 +1,18 @@
 FROM golang:1.26-alpine AS builder
+RUN apk add --no-cache git
 ARG FRAMEWORK
 WORKDIR /app
-COPY go/${FRAMEWORK}/ .
+
+# Copy shared pgstore module first
+COPY go/pgstore/ ./pgstore/
+
+# Copy the framework
+COPY go/${FRAMEWORK}/ ./${FRAMEWORK}/
+
 ENV GONOSUMCHECK='*'
 ENV GONOSUMDB='*'
-RUN go build -ldflags="-s -w" -o server .
+RUN cd ${FRAMEWORK} && go build -ldflags="-s -w" -o /server .
 
 FROM alpine:3.21
-COPY --from=builder /app/server /server
+COPY --from=builder /server /server
 CMD ["/server"]

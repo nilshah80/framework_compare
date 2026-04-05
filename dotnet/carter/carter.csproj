@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <PackageReference Include="Carter" Version="9.0.0" />
+    <ProjectReference Include="../PgStore/PgStore.csproj" />
   </ItemGroup>
 
 </Project>

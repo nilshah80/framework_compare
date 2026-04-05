@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,12 +10,62 @@ import (
 	"sync"
 	"time"
 
+	"benchmark/pgstore"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/helmet"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
 )
+
+var pgStore *pgstore.PgStore
+
+func toPgItems(items []OrderItem) []pgstore.OrderItem {
+	result := make([]pgstore.OrderItem, len(items))
+	for i, item := range items {
+		result[i] = pgstore.OrderItem{ProductID: item.ProductID, Name: item.Name, Quantity: item.Quantity, Price: item.Price}
+	}
+	return result
+}
+
+func fromPgItems(items []pgstore.OrderItem) []OrderItem {
+	result := make([]OrderItem, len(items))
+	for i, item := range items {
+		result[i] = OrderItem{ProductID: item.ProductID, Name: item.Name, Quantity: item.Quantity, Price: item.Price}
+	}
+	return result
+}
+
+func toPgProfile(p UserProfile) pgstore.Profile {
+	payment := make([]pgstore.PaymentMethod, len(p.Payment))
+	for i, pm := range p.Payment {
+		payment[i] = pgstore.PaymentMethod{Type: pm.Type, Last4: pm.Last4, ExpiryMonth: pm.ExpiryMonth, ExpiryYear: pm.ExpiryYear, IsDefault: pm.IsDefault}
+	}
+	return pgstore.Profile{
+		Name: p.Name, Email: p.Email, Phone: p.Phone,
+		Address: pgstore.Address{Street: p.Address.Street, City: p.Address.City, State: p.Address.State, Zip: p.Address.Zip, Country: p.Address.Country},
+		Preferences: pgstore.Preferences{Language: p.Preferences.Language, Currency: p.Preferences.Currency, Timezone: p.Preferences.Timezone,
+			Notifications: pgstore.NotificationPrefs{Email: p.Preferences.Notifications.Email, SMS: p.Preferences.Notifications.SMS, Push: p.Preferences.Notifications.Push},
+			Theme: p.Preferences.Theme},
+		Payment: payment, Tags: p.Tags, Metadata: p.Metadata,
+	}
+}
+
+func fromPgProfile(p pgstore.Profile) UserProfile {
+	payment := make([]PaymentMethod, len(p.Payment))
+	for i, pm := range p.Payment {
+		payment[i] = PaymentMethod{Type: pm.Type, Last4: pm.Last4, ExpiryMonth: pm.ExpiryMonth, ExpiryYear: pm.ExpiryYear, IsDefault: pm.IsDefault}
+	}
+	return UserProfile{
+		UserID: p.UserID, Name: p.Name, Email: p.Email, Phone: p.Phone,
+		Address: Address{Street: p.Address.Street, City: p.Address.City, State: p.Address.State, Zip: p.Address.Zip, Country: p.Address.Country},
+		Preferences: Preferences{Language: p.Preferences.Language, Currency: p.Preferences.Currency, Timezone: p.Preferences.Timezone,
+			Notifications: NotificationPrefs{Email: p.Preferences.Notifications.Email, SMS: p.Preferences.Notifications.SMS, Push: p.Preferences.Notifications.Push},
+			Theme: p.Preferences.Theme},
+		Payment: payment, Tags: p.Tags, Metadata: p.Metadata,
+	}
+}
 
 // --- Request/Response types ---
 
@@ -157,6 +208,9 @@ func structuredLoggerMiddleware(c *fiber.Ctx) error {
 		reqHeaders[string(key)] = redactSensitiveFields(string(key), string(value))
 	})
 
+	// Read request body before handler executes (matching aarv's verboselog)
+	reqBody := string(c.Body())
+
 	// Continue processing
 	err := c.Next()
 
@@ -184,6 +238,7 @@ func structuredLoggerMiddleware(c *fiber.Ctx) error {
 		slog.String("client_ip", c.IP()),
 		slog.String("user_agent", c.Get("User-Agent")),
 		slog.Any("request_headers", reqHeaders),
+		slog.String("request_body", reqBody),
 		slog.Int("status", c.Response().StatusCode()),
 		slog.String("latency", latency.String()),
 		slog.Float64("latency_ms", latencyMs),
@@ -198,6 +253,23 @@ func structuredLoggerMiddleware(c *fiber.Ctx) error {
 func main() {
 	// Set up slog JSON handler for structured logging
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	if dsn := os.Getenv("PG_DSN"); dsn != "" {
+		var err error
+		pgStore, err = pgstore.New(context.Background(), dsn)
+		if err != nil {
+			slog.Error("failed to connect to PostgreSQL", "error", err)
+			os.Exit(1)
+		}
+		defer pgStore.Close()
+		if err := pgStore.InitSchema(context.Background()); err != nil {
+			slog.Error("failed to init schema", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("using PostgreSQL store", "dsn", dsn)
+	} else {
+		slog.Info("using in-memory store")
+	}
 
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
@@ -241,6 +313,20 @@ func main() {
 		}
 
 		userID := c.Params("userId")
+		requestID, _ := c.Locals("requestid").(string)
+
+		if pgStore != nil {
+			order, err := pgStore.CreateOrder(c.UserContext(), userID, toPgItems(req.Items), req.Currency)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			return c.Status(http.StatusCreated).JSON(OrderResponse{
+				OrderID: order.OrderID, UserID: order.UserID, Status: order.Status,
+				Items: fromPgItems(order.Items), Total: order.Total, Currency: order.Currency,
+				RequestID: requestID,
+			})
+		}
+
 		orderID := nextOrderID()
 
 		var total float64
@@ -252,8 +338,6 @@ func main() {
 		if currency == "" {
 			currency = "USD"
 		}
-
-		requestID, _ := c.Locals("requestid").(string)
 
 		order := OrderResponse{
 			OrderID:   orderID,
@@ -282,6 +366,21 @@ func main() {
 		userID := c.Params("userId")
 		orderID := c.Params("orderId")
 		requestID, _ := c.Locals("requestid").(string)
+
+		if pgStore != nil {
+			order, found, err := pgStore.UpdateOrder(c.UserContext(), userID, orderID, toPgItems(body.Items), body.Currency)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			if !found {
+				return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "order not found", "order_id": orderID, "request_id": requestID})
+			}
+			return c.JSON(OrderResponse{
+				OrderID: order.OrderID, UserID: order.UserID, Status: order.Status,
+				Items: fromPgItems(order.Items), Total: order.Total, Currency: order.Currency,
+				RequestID: requestID,
+			})
+		}
 
 		key := storeKey(userID, orderID)
 
@@ -322,6 +421,17 @@ func main() {
 		orderID := c.Params("orderId")
 		requestID, _ := c.Locals("requestid").(string)
 
+		if pgStore != nil {
+			found, err := pgStore.DeleteOrder(c.UserContext(), userID, orderID)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			if !found {
+				return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "order not found", "order_id": orderID, "request_id": requestID})
+			}
+			return c.JSON(fiber.Map{"message": "order deleted", "order_id": orderID, "request_id": requestID})
+		}
+
 		key := storeKey(userID, orderID)
 
 		orderMu.Lock()
@@ -352,6 +462,21 @@ func main() {
 
 		requestID, _ := c.Locals("requestid").(string)
 
+		if pgStore != nil {
+			order, found, err := pgStore.GetOrder(c.UserContext(), userID, orderID)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			if !found {
+				return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "order not found", "order_id": orderID, "request_id": requestID})
+			}
+			return c.JSON(OrderResponse{
+				OrderID: order.OrderID, UserID: order.UserID, Status: order.Status,
+				Items: fromPgItems(order.Items), Total: order.Total, Currency: order.Currency,
+				Fields: fields, RequestID: requestID,
+			})
+		}
+
 		orderMu.RLock()
 		order, ok := orderStore[storeKey(userID, orderID)]
 		orderMu.RUnlock()
@@ -378,6 +503,35 @@ func main() {
 
 		userID := c.Params("userId")
 		requestID, _ := c.Locals("requestid").(string)
+
+		if pgStore != nil {
+			var bulkItems []struct {
+				Items    []pgstore.OrderItem
+				Currency string
+			}
+			for _, o := range req.Orders {
+				bulkItems = append(bulkItems, struct {
+					Items    []pgstore.OrderItem
+					Currency string
+				}{Items: toPgItems(o.Items), Currency: o.Currency})
+			}
+			orders, totalSum, err := pgStore.BulkCreateOrders(c.UserContext(), userID, bulkItems)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			var results []OrderResponse
+			for _, o := range orders {
+				results = append(results, OrderResponse{
+					OrderID: o.OrderID, UserID: o.UserID, Status: o.Status,
+					Items: fromPgItems(o.Items), Total: o.Total, Currency: o.Currency,
+					RequestID: requestID,
+				})
+			}
+			return c.Status(http.StatusCreated).JSON(BulkOrderResponse{
+				UserID: userID, Count: len(results), Orders: results,
+				TotalSum: totalSum, RequestID: requestID,
+			})
+		}
 
 		var results []OrderResponse
 		var totalSum float64
@@ -422,6 +576,25 @@ func main() {
 		userID := c.Params("userId")
 		requestID, _ := c.Locals("requestid").(string)
 
+		if pgStore != nil {
+			pgOrders, err := pgStore.ListOrders(c.UserContext(), userID)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			var results []OrderResponse
+			for _, o := range pgOrders {
+				results = append(results, OrderResponse{
+					OrderID: o.OrderID, UserID: o.UserID, Status: o.Status,
+					Items: fromPgItems(o.Items), Total: o.Total, Currency: o.Currency,
+					RequestID: requestID,
+				})
+			}
+			return c.JSON(fiber.Map{
+				"user_id": userID, "count": len(results),
+				"orders": results, "request_id": requestID,
+			})
+		}
+
 		prefix := userID + ":"
 		var results []OrderResponse
 
@@ -455,6 +628,13 @@ func main() {
 		profile.UserID = userID
 		profile.RequestID = requestID
 
+		if pgStore != nil {
+			if err := pgStore.UpsertProfile(c.UserContext(), userID, toPgProfile(profile)); err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			return c.JSON(profile)
+		}
+
 		profileMu.Lock()
 		profileStore[userID] = profile
 		profileMu.Unlock()
@@ -466,6 +646,19 @@ func main() {
 	app.Get("/users/:userId/profile", func(c *fiber.Ctx) error {
 		userID := c.Params("userId")
 		requestID, _ := c.Locals("requestid").(string)
+
+		if pgStore != nil {
+			p, found, err := pgStore.GetProfile(c.UserContext(), userID)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "database error"})
+			}
+			if !found {
+				return c.Status(http.StatusNotFound).JSON(fiber.Map{"error": "profile not found"})
+			}
+			result := fromPgProfile(p)
+			result.RequestID = requestID
+			return c.JSON(result)
+		}
 
 		profileMu.RLock()
 		profile, ok := profileStore[userID]
